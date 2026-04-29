@@ -55,11 +55,11 @@ cargo build --release
 code-atlas/
 ├── third_party/          # C/C++ dependencies (llama.cpp, tree-sitter, etc.)
 ├── crates/               # Rust modular workspace
-│   ├── agent-cli/        # CLI & TUI entry point
-│   ├── agent-core/       # Agent orchestration & RAG流水线
-│   ├── agent-parser/     # AST Code chunking engine
-│   ├── agent-vdb/        # Local Vector DB & ONNX Embeddings
-│   └── agent-llm/        # FFI LLM Inference wrapper
+│   ├── atlas-cli/        # CLI & TUI entry point
+│   ├── atlas-core/       # Agent orchestration & RAG流水线
+│   ├── atlas-parser/     # AST Code chunking engine
+│   ├── atlas-vdb/        # Local Vector DB & ONNX Embeddings
+│   └── atlas-llm/        # FFI LLM Inference wrapper
 └── tests/                # Integration tests
 ```
 
