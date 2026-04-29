@@ -56,7 +56,7 @@ code-atlas/
 ├── third_party/          # C/C++ dependencies (llama.cpp, tree-sitter, etc.)
 ├── crates/               # Rust modular workspace
 │   ├── atlas-cli/        # CLI & TUI entry point
-│   ├── atlas-core/       # Agent orchestration & RAG流水线
+│   ├── atlas-core/       # Agent orchestration & RAG pipeline
 │   ├── atlas-parser/     # AST Code chunking engine
 │   ├── atlas-vdb/        # Local Vector DB & ONNX Embeddings
 │   └── atlas-llm/        # FFI LLM Inference wrapper
