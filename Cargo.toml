@@ -1,6 +1,9 @@
-[package]
-name = "code-atlas"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = [
+    "crates/atlas-cli",
+    "crates/atlas-core",
+    "crates/atlas-parser",
+    "crates/atlas-vdb",
+    "crates/atlas-llm",
+]
+resolver = "3"
