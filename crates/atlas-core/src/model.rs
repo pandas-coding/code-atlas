@@ -147,7 +147,7 @@ impl ParseResult {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexStats {
     pub total_files: usize,
     pub parsed_files: usize,

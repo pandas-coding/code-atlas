@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::error::{AtlasError, AtlasResult};
 use crate::ignore;
 use crate::model::{FileLanguage, SourceFile};
@@ -228,7 +230,7 @@ impl Scanner {
 
         scan_result
             .source_files
-            .into_iter()
+            .into_par_iter()
             .map(|path| {
                 let source_text = fs::read_to_string(&path).map_err(|e| {
                     AtlasError::io(format!("Failed to read file {}: {e}", path.display()))

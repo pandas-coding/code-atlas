@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dev-dependencies]
+atlas-parser = { path = "../atlas-parser" }
 tempfile = "3"
 
 [dependencies]
+clap = { workspace = true }
+rayon = { workspace = true }
