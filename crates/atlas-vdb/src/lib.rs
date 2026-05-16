@@ -10,4 +10,4 @@ pub use embedding::EmbeddingService;
 pub use error::{VdbError, VdbResult};
 pub use model::{EmbeddingVector, SearchQuery, SearchResult};
 pub use onnx::OnnxEmbeddingService;
-pub use store::VectorStore;
+pub use store::{InMemoryVectorStore, VectorStore};
