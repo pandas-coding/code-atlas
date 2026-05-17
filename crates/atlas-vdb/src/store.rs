@@ -4,13 +4,19 @@ use std::path::Path;
 
 use crate::error::{VdbContext, VdbError, VdbResult};
 use crate::model::EmbeddingVector;
+use crate::similarity::cosine_similarity;
 
 const MAGIC: [u8; 4] = *b"ATVS";
 const VERSION: u32 = 1;
 
 pub trait VectorStore: Send + Sync {
     fn add(&mut self, vectors: Vec<EmbeddingVector>) -> VdbResult<()>;
-    fn search(&self, query: &[f32], top_k: usize) -> VdbResult<Vec<(String, f32)>>;
+    fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        min_score: Option<f32>,
+    ) -> VdbResult<Vec<(String, f32)>>;
     fn save(&self, path: &Path) -> VdbResult<()>;
     fn load(path: &Path) -> VdbResult<Self>
     where
@@ -85,7 +91,12 @@ impl VectorStore for InMemoryVectorStore {
         Ok(())
     }
 
-    fn search(&self, query: &[f32], top_k: usize) -> VdbResult<Vec<(String, f32)>> {
+    fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        min_score: Option<f32>,
+    ) -> VdbResult<Vec<(String, f32)>> {
         if self.vectors.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
@@ -103,19 +114,16 @@ impl VectorStore for InMemoryVectorStore {
             return Ok(Vec::new());
         }
 
+        let min = min_score.unwrap_or(f32::NEG_INFINITY);
+
         let mut scores: Vec<(String, f32)> = self
             .vectors
             .iter()
             .map(|ev| {
-                let dot: f32 = ev.vector.iter().zip(query.iter()).map(|(a, b)| a * b).sum();
-                let vec_norm: f32 = ev.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let score = if vec_norm == 0.0 {
-                    0.0
-                } else {
-                    dot / (query_norm * vec_norm)
-                };
+                let score = cosine_similarity(query, &ev.vector);
                 (ev.chunk_id.clone(), score)
             })
+            .filter(|(_, score)| *score >= min)
             .collect();
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -133,23 +141,23 @@ impl VectorStore for InMemoryVectorStore {
 
         let mut writer = BufWriter::new(file);
 
-        writer.write_all(&MAGIC).map_err(|e| {
-            VdbError::io("Failed to write magic bytes").with_source(e.to_string())
-        })?;
+        writer
+            .write_all(&MAGIC)
+            .map_err(|e| VdbError::io("Failed to write magic bytes").with_source(e.to_string()))?;
 
-        writer.write_all(&VERSION.to_le_bytes()).map_err(|e| {
-            VdbError::io("Failed to write version").with_source(e.to_string())
-        })?;
+        writer
+            .write_all(&VERSION.to_le_bytes())
+            .map_err(|e| VdbError::io("Failed to write version").with_source(e.to_string()))?;
 
         let count = self.vectors.len() as u32;
-        writer.write_all(&count.to_le_bytes()).map_err(|e| {
-            VdbError::io("Failed to write count").with_source(e.to_string())
-        })?;
+        writer
+            .write_all(&count.to_le_bytes())
+            .map_err(|e| VdbError::io("Failed to write count").with_source(e.to_string()))?;
 
         let dim = self.dimension as u32;
-        writer.write_all(&dim.to_le_bytes()).map_err(|e| {
-            VdbError::io("Failed to write dimension").with_source(e.to_string())
-        })?;
+        writer
+            .write_all(&dim.to_le_bytes())
+            .map_err(|e| VdbError::io("Failed to write dimension").with_source(e.to_string()))?;
 
         for ev in &self.vectors {
             let chunk_id_bytes = ev.chunk_id.as_bytes();
@@ -157,9 +165,9 @@ impl VectorStore for InMemoryVectorStore {
             writer.write_all(&chunk_id_len.to_le_bytes()).map_err(|e| {
                 VdbError::io("Failed to write chunk_id length").with_source(e.to_string())
             })?;
-            writer.write_all(chunk_id_bytes).map_err(|e| {
-                VdbError::io("Failed to write chunk_id").with_source(e.to_string())
-            })?;
+            writer
+                .write_all(chunk_id_bytes)
+                .map_err(|e| VdbError::io("Failed to write chunk_id").with_source(e.to_string()))?;
 
             let vector_bytes: Vec<u8> = ev.vector.iter().flat_map(|f| f.to_le_bytes()).collect();
             writer.write_all(&vector_bytes).map_err(|e| {
@@ -167,9 +175,9 @@ impl VectorStore for InMemoryVectorStore {
             })?;
         }
 
-        writer.flush().map_err(|e| {
-            VdbError::io("Failed to flush file").with_source(e.to_string())
-        })?;
+        writer
+            .flush()
+            .map_err(|e| VdbError::io("Failed to flush file").with_source(e.to_string()))?;
 
         Ok(())
     }
@@ -268,13 +276,10 @@ impl VectorStore for InMemoryVectorStore {
                     .with_source(e.to_string())
             })?;
 
-            let chunk_id = String::from_utf8(chunk_id_bytes)
-                .map_err(|e| {
-                    VdbError::storage(format!("Invalid chunk_id UTF-8: {e}"))
-                        .with_context(
-                            VdbContext::default().with_path(path).with_operation("load"),
-                        )
-                })?;
+            let chunk_id = String::from_utf8(chunk_id_bytes).map_err(|e| {
+                VdbError::storage(format!("Invalid chunk_id UTF-8: {e}"))
+                    .with_context(VdbContext::default().with_path(path).with_operation("load"))
+            })?;
 
             let mut vector_bytes = vec![0u8; dimension * 4];
             reader.read_exact(&mut vector_bytes).map_err(|e| {
@@ -317,7 +322,9 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
 
-        store.add(vec![make_vector("c1", vec![1.0, 0.0, 0.0])]).unwrap();
+        store
+            .add(vec![make_vector("c1", vec![1.0, 0.0, 0.0])])
+            .unwrap();
         assert_eq!(store.len(), 1);
         assert!(!store.is_empty());
 
@@ -356,10 +363,7 @@ mod tests {
     fn test_find() {
         let mut store = InMemoryVectorStore::new();
         store
-            .add(vec![
-                make_vector("c1", vec![1.0, 0.0]),
-                make_vector("c2", vec![0.0, 1.0]),
-            ])
+            .add(vec![make_vector("c1", vec![1.0, 0.0]), make_vector("c2", vec![0.0, 1.0])])
             .unwrap();
 
         assert!(store.find("c1").is_some());
@@ -375,10 +379,7 @@ mod tests {
     fn test_clear() {
         let mut store = InMemoryVectorStore::new();
         store
-            .add(vec![
-                make_vector("c1", vec![1.0, 0.0]),
-                make_vector("c2", vec![0.0, 1.0]),
-            ])
+            .add(vec![make_vector("c1", vec![1.0, 0.0]), make_vector("c2", vec![0.0, 1.0])])
             .unwrap();
         assert_eq!(store.len(), 2);
 
@@ -399,7 +400,7 @@ mod tests {
             ])
             .unwrap();
 
-        let results = store.search(&[1.0, 0.0, 0.0], 2).unwrap();
+        let results = store.search(&[1.0, 0.0, 0.0], 2, None).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "c1");
         assert!(results[0].1 > results[1].1);
@@ -408,7 +409,7 @@ mod tests {
     #[test]
     fn test_search_empty_store() {
         let store = InMemoryVectorStore::new();
-        let results = store.search(&[1.0, 0.0], 5).unwrap();
+        let results = store.search(&[1.0, 0.0], 5, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -417,8 +418,64 @@ mod tests {
         let mut store = InMemoryVectorStore::new();
         store.add(vec![make_vector("c1", vec![1.0, 0.0])]).unwrap();
 
-        let result = store.search(&[1.0, 0.0, 0.0], 5);
+        let result = store.search(&[1.0, 0.0, 0.0], 5, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_search_min_score_filter() {
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![
+                make_vector("c1", vec![1.0, 0.0, 0.0]),
+                make_vector("c2", vec![0.0, 1.0, 0.0]),
+                make_vector("c3", vec![0.9, 0.1, 0.0]),
+            ])
+            .unwrap();
+
+        let results = store.search(&[1.0, 0.0, 0.0], 10, Some(0.9)).unwrap();
+        for (_, score) in &results {
+            assert!(*score >= 0.9, "Score {} below threshold 0.9", score);
+        }
+    }
+
+    #[test]
+    fn test_search_min_score_filters_all() {
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![
+                make_vector("c1", vec![0.0, 1.0, 0.0]),
+                make_vector("c2", vec![0.0, 0.0, 1.0]),
+            ])
+            .unwrap();
+
+        let results = store.search(&[1.0, 0.0, 0.0], 10, Some(0.5)).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_results_sorted_descending() {
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![
+                make_vector("c1", vec![1.0, 0.0, 0.0]),
+                make_vector("c2", vec![0.0, 1.0, 0.0]),
+                make_vector(
+                    "c3",
+                    vec![std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0],
+                ),
+            ])
+            .unwrap();
+
+        let results = store.search(&[1.0, 0.0, 0.0], 10, None).unwrap();
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].1 >= results[i].1,
+                "Results not sorted descending: {} > {}",
+                results[i - 1].1,
+                results[i].1
+            );
+        }
     }
 
     #[test]
@@ -456,9 +513,7 @@ mod tests {
 
     #[test]
     fn test_load_file_not_found() {
-        let result = InMemoryVectorStore::load(Path::new(
-            "/nonexistent/path/test.vdb",
-        ));
+        let result = InMemoryVectorStore::load(Path::new("/nonexistent/path/test.vdb"));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("File not found"));

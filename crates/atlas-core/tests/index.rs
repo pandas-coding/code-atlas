@@ -402,9 +402,11 @@ fn index_large_file_partial_read() {
     }
     fs::write(root.join("big.rs"), &big_content).unwrap();
 
-    let mut options = IndexOptions::default();
-    options.large_file_threshold = 100;
-    options.large_file_max_lines = 50;
+    let options = IndexOptions {
+        large_file_threshold: 100,
+        large_file_max_lines: 50,
+        ..IndexOptions::default()
+    };
 
     let result = index_path_with_options(root, &parse_source, &options).unwrap();
 
@@ -426,8 +428,7 @@ fn index_chunk_split_threshold() {
     long_code.push_str("}\n");
     fs::write(root.join("big_fn.rs"), &long_code).unwrap();
 
-    let mut options = IndexOptions::default();
-    options.chunk_split_threshold = 200;
+    let options = IndexOptions { chunk_split_threshold: 200, ..IndexOptions::default() };
 
     let result = index_path_with_options(root, &parse_source, &options).unwrap();
 
@@ -443,8 +444,10 @@ fn index_incremental_skips_unchanged_files() {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
-    let mut options = IndexOptions::default();
-    options.incremental_state_path = Some(state_path.clone());
+    let options = IndexOptions {
+        incremental_state_path: Some(state_path.clone()),
+        ..IndexOptions::default()
+    };
 
     let result1 = index_path_with_options(root, &parse_source, &options).unwrap();
     assert_eq!(result1.stats.total_files, 1);
@@ -466,8 +469,10 @@ fn index_incremental_reindexes_changed_files() {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
-    let mut options = IndexOptions::default();
-    options.incremental_state_path = Some(state_path.clone());
+    let options = IndexOptions {
+        incremental_state_path: Some(state_path.clone()),
+        ..IndexOptions::default()
+    };
 
     let result1 = index_path_with_options(root, &parse_source, &options).unwrap();
     assert_eq!(result1.stats.parsed_files, 1);
