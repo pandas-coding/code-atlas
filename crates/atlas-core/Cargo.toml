@@ -8,6 +8,7 @@ atlas-parser = { path = "../atlas-parser" }
 tempfile = "3"
 
 [dependencies]
+atlas-vdb = { path = "../atlas-vdb" }
 clap = { workspace = true }
 rayon = { workspace = true }
 log = { workspace = true }

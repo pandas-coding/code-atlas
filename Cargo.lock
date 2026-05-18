@@ -103,6 +103,7 @@ dependencies = [
  "assert_cmd",
  "atlas-core",
  "atlas-parser",
+ "atlas-vdb",
  "clap",
  "env_logger",
  "log",
@@ -115,6 +116,7 @@ name = "atlas-core"
 version = "0.1.0"
 dependencies = [
  "atlas-parser",
+ "atlas-vdb",
  "clap",
  "ignore",
  "log",

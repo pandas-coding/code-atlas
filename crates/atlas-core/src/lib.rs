@@ -5,8 +5,8 @@ use rayon::prelude::*;
 
 pub use error::{AtlasError, AtlasResult, ErrorContext, ErrorKind, ErrorSeverity};
 pub use model::{
-    ChunkKind, ChunkSpan, CodeChunk, FileLanguage, FileState, IndexOptions, IndexResult,
-    IndexState, IndexStats, ParseResult, SourceFile,
+    ChunkKind, ChunkSpan, CodeChunk, EmbeddingOptions, FileLanguage, FileState, IndexOptions,
+    IndexResult, IndexState, IndexStats, ParseResult, SourceFile,
 };
 pub use scanner::{ScanOptions, ScanResult, Scanner};
 
@@ -51,6 +51,7 @@ pub fn index_path(path: impl Into<PathBuf>, parser: &dyn ParseSource) -> AtlasRe
 /// 4. Parallel parsing via the provided `parser`
 /// 5. Chunk splitting for oversized chunks
 /// 6. Result aggregation, statistics computation, and state persistence
+/// 7. Embedding generation and vector store persistence (if configured)
 ///
 /// Returns an [`IndexResult`] with all parsed chunks and statistics,
 /// or an [`AtlasError`] if the path is invalid.
@@ -196,6 +197,14 @@ pub fn index_path_with_options(
         }
     }
 
+    if let Some(ref embedding_opts) = options.embedding {
+        let (embedded, emb_errors, dimension) =
+            run_embedding(&index_result, embedding_opts);
+        index_result.stats.embedded_chunks = embedded;
+        index_result.stats.embedding_errors = emb_errors;
+        index_result.stats.embedding_dimension = dimension;
+    }
+
     log::info!(
         "Index complete: {} files parsed, {} chunks, {} errors in {}ms",
         index_result.stats.parsed_files,
@@ -205,6 +214,93 @@ pub fn index_path_with_options(
     );
 
     Ok(index_result)
+}
+
+fn run_embedding(
+    index_result: &IndexResult,
+    opts: &EmbeddingOptions,
+) -> (usize, usize, usize) {
+    use atlas_vdb::{EmbeddingService, EmbeddingVector, InMemoryVectorStore, VectorStore};
+
+    log::info!("Starting embedding generation for {} chunks", index_result.stats.total_chunks);
+
+    let embedding_service = match atlas_vdb::OnnxEmbeddingService::new(opts.config.clone()) {
+        Ok(svc) => svc,
+        Err(e) => {
+            log::error!("Failed to initialize embedding service: {}", e);
+            return (0, index_result.stats.total_chunks, 0);
+        }
+    };
+
+    let all_chunks: Vec<&CodeChunk> = index_result
+        .files
+        .iter()
+        .flat_map(|f| f.chunks.iter())
+        .collect();
+
+    if all_chunks.is_empty() {
+        log::info!("No chunks to embed");
+        return (0, 0, 0);
+    }
+
+    let batch_size = if opts.batch_size == 0 { 32 } else { opts.batch_size };
+    let mut store = InMemoryVectorStore::new();
+    let mut embedded = 0usize;
+    let mut emb_errors = 0usize;
+
+    for batch in all_chunks.chunks(batch_size) {
+        let texts: Vec<&str> = batch.iter().map(|c| c.source_text.as_str()).collect();
+        match embedding_service.embed(&texts) {
+            Ok(vectors) => {
+                let mut embedding_vectors = Vec::with_capacity(vectors.len());
+                for (chunk, vector) in batch.iter().zip(vectors.into_iter()) {
+                    embedding_vectors.push(EmbeddingVector::new(&chunk.id, vector));
+                }
+                match store.add(embedding_vectors) {
+                    Ok(()) => embedded += batch.len(),
+                    Err(e) => {
+                        log::warn!("Failed to add embedding vectors to store: {}", e);
+                        emb_errors += batch.len();
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Embedding inference failed for batch: {}", e);
+                emb_errors += batch.len();
+            }
+        }
+    }
+
+    let dimension = embedding_service.dimension();
+
+    if embedded > 0 {
+        if let Some(parent) = opts.vector_store_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("Failed to create vector store directory: {}", e);
+            }
+        }
+        match store.save(&opts.vector_store_path) {
+            Ok(()) => {
+                log::info!(
+                    "Saved vector store with {} vectors to {}",
+                    store.len(),
+                    opts.vector_store_path.display()
+                );
+            }
+            Err(e) => {
+                log::warn!("Failed to save vector store: {}", e);
+            }
+        }
+    }
+
+    log::info!(
+        "Embedding complete: {} chunks embedded, {} errors, dimension {}",
+        embedded,
+        emb_errors,
+        dimension
+    );
+
+    (embedded, emb_errors, dimension)
 }
 
 /// Splits a large chunk into smaller pieces by blank-line boundaries.

@@ -286,6 +286,12 @@ pub struct IndexStats {
     pub total_source_bytes: usize,
     /// Total elapsed time in milliseconds.
     pub elapsed_ms: u64,
+    /// Number of chunks successfully embedded (0 if embedding disabled).
+    pub embedded_chunks: usize,
+    /// Number of chunks that failed during embedding (0 if embedding disabled).
+    pub embedding_errors: usize,
+    /// Dimension of the embedding vectors (0 if embedding disabled).
+    pub embedding_dimension: usize,
 }
 
 /// Complete result of an indexing operation across multiple files.
@@ -345,6 +351,9 @@ impl IndexResult {
                 chunks_by_kind,
                 total_source_bytes,
                 elapsed_ms: 0,
+                embedded_chunks: 0,
+                embedding_errors: 0,
+                embedding_dimension: 0,
             },
             files,
             errors,
@@ -355,6 +364,20 @@ impl IndexResult {
     pub fn set_elapsed_ms(&mut self, ms: u64) {
         self.stats.elapsed_ms = ms;
     }
+}
+
+/// Embedding options for the indexing pipeline.
+///
+/// When provided, the indexer will generate vector embeddings for all
+/// code chunks and persist the vector store to disk.
+#[derive(Debug, Clone)]
+pub struct EmbeddingOptions {
+    /// Configuration for the embedding model (model path, dimension, etc.).
+    pub config: atlas_vdb::EmbeddingConfig,
+    /// Path to save the vector store file after indexing.
+    pub vector_store_path: PathBuf,
+    /// Optional batch size for embedding inference (default: 32).
+    pub batch_size: usize,
 }
 
 /// Configuration options for the indexing pipeline.
@@ -380,16 +403,26 @@ pub struct IndexOptions {
     /// Chunks exceeding this threshold are subdivided into smaller
     /// pieces. Default: 3000.
     pub chunk_split_threshold: usize,
+    /// Embedding options. When `None`, no embedding is performed (M1 behavior).
+    pub embedding: Option<EmbeddingOptions>,
 }
 
-impl Default for IndexOptions {
-    fn default() -> Self {
+impl IndexOptions {
+    /// Creates `IndexOptions` with default values.
+    pub fn new() -> Self {
         Self {
             incremental_state_path: None,
             large_file_threshold: 1024 * 1024,
             large_file_max_lines: 500,
             chunk_split_threshold: 3000,
+            embedding: None,
         }
+    }
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
