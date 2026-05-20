@@ -534,4 +534,172 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_add_batch_preserves_order() {
+        let mut store = InMemoryVectorStore::new();
+        let vectors: Vec<EmbeddingVector> = (0..5)
+            .map(|i| make_vector(&format!("c{}", i), vec![i as f32, 0.0, 0.0]))
+            .collect();
+        store.add(vectors).unwrap();
+        assert_eq!(store.len(), 5);
+        for i in 0..5 {
+            let found = store.find(&format!("c{}", i)).unwrap();
+            assert_eq!(found.vector, vec![i as f32, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn test_add_and_find_roundtrip() {
+        let mut store = InMemoryVectorStore::new();
+        let v1 = make_vector("chunk_a", vec![1.0, 2.0, 3.0]);
+        let v2 = make_vector("chunk_b", vec![4.0, 5.0, 6.0]);
+        store.add(vec![v1.clone(), v2.clone()]).unwrap();
+
+        let found_a = store.find("chunk_a").unwrap();
+        assert_eq!(found_a.chunk_id, "chunk_a");
+        assert_eq!(found_a.vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(found_a.dimension, 3);
+
+        let found_b = store.find("chunk_b").unwrap();
+        assert_eq!(found_b.chunk_id, "chunk_b");
+        assert_eq!(found_b.vector, vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_save_load_preserves_many_vectors() {
+        let dir = std::env::temp_dir().join("atlas_vdb_test_many_vectors");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("many.vdb");
+
+        let mut store = InMemoryVectorStore::new();
+        let dim = 16;
+        let count = 50;
+        let mut vectors = Vec::with_capacity(count);
+        for i in 0..count {
+            let vals: Vec<f32> = (0..dim).map(|j| (i * dim + j) as f32 * 0.01).collect();
+            vectors.push(make_vector(&format!("vec_{}", i), vals));
+        }
+        store.add(vectors).unwrap();
+        assert_eq!(store.len(), count);
+
+        store.save(&path).unwrap();
+        let loaded = InMemoryVectorStore::load(&path).unwrap();
+        assert_eq!(loaded.len(), count);
+        assert_eq!(loaded.dimension(), dim);
+
+        for i in 0..count {
+            let found = loaded.find(&format!("vec_{}", i)).unwrap();
+            let expected: Vec<f32> = (0..dim).map(|j| (i * dim + j) as f32 * 0.01).collect();
+            assert_eq!(found.vector, expected);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_load_with_unicode_chunk_id() {
+        let dir = std::env::temp_dir().join("atlas_vdb_test_unicode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unicode.vdb");
+
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![
+                make_vector("模块::函数", vec![1.0, 0.0]),
+                make_vector("クラス::メソッド", vec![0.0, 1.0]),
+            ])
+            .unwrap();
+
+        store.save(&path).unwrap();
+        let loaded = InMemoryVectorStore::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.find("模块::函数").is_some());
+        assert!(loaded.find("クラス::メソッド").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_load_preserves_search_results() {
+        let dir = std::env::temp_dir().join("atlas_vdb_test_search_after_load");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("search.vdb");
+
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![
+                make_vector("c1", vec![1.0, 0.0, 0.0]),
+                make_vector("c2", vec![0.0, 1.0, 0.0]),
+                make_vector("c3", vec![0.9, 0.1, 0.0]),
+            ])
+            .unwrap();
+
+        let before = store.search(&[1.0, 0.0, 0.0], 3, None).unwrap();
+
+        store.save(&path).unwrap();
+        let loaded = InMemoryVectorStore::load(&path).unwrap();
+        let after = loaded.search(&[1.0, 0.0, 0.0], 3, None).unwrap();
+
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert_eq!(b.0, a.0);
+            assert!((b.1 - a.1).abs() < 1e-6);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_top_k_fewer_than_total() {
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![
+                make_vector("c1", vec![1.0, 0.0]),
+                make_vector("c2", vec![0.9, 0.1]),
+                make_vector("c3", vec![0.0, 1.0]),
+                make_vector("c4", vec![0.1, 0.9]),
+            ])
+            .unwrap();
+
+        let results = store.search(&[1.0, 0.0], 2, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "c1");
+    }
+
+    #[test]
+    fn test_search_top_k_greater_than_total() {
+        let mut store = InMemoryVectorStore::new();
+        store
+            .add(vec![make_vector("c1", vec![1.0, 0.0]), make_vector("c2", vec![0.0, 1.0])])
+            .unwrap();
+
+        let results = store.search(&[1.0, 0.0], 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_top_k_zero() {
+        let mut store = InMemoryVectorStore::new();
+        store.add(vec![make_vector("c1", vec![1.0, 0.0])]).unwrap();
+        let results = store.search(&[1.0, 0.0], 0, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_with_capacity() {
+        let store = InMemoryVectorStore::with_capacity(100);
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.dimension(), 0);
+    }
+
+    #[test]
+    fn test_add_vector_length_mismatch_with_dimension() {
+        let mut store = InMemoryVectorStore::new();
+        let bad_vector =
+            EmbeddingVector { chunk_id: "c1".to_string(), vector: vec![1.0, 0.0], dimension: 3 };
+        let result = store.add(vec![bad_vector]);
+        assert!(result.is_err());
+    }
 }

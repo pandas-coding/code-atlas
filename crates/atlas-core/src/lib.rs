@@ -198,7 +198,19 @@ pub fn index_path_with_options(
     }
 
     if let Some(ref embedding_opts) = options.embedding {
-        let (embedded, emb_errors, dimension) = run_embedding(&index_result, embedding_opts);
+        let embedding_service =
+            match atlas_vdb::OnnxEmbeddingService::new(embedding_opts.config.clone()) {
+                Ok(svc) => svc,
+                Err(e) => {
+                    log::error!("Failed to initialize embedding service: {}", e);
+                    index_result.stats.embedded_chunks = 0;
+                    index_result.stats.embedding_errors = index_result.stats.total_chunks;
+                    index_result.stats.embedding_dimension = 0;
+                    return Ok(index_result);
+                }
+            };
+        let (embedded, emb_errors, dimension) =
+            run_embedding_with_service(&index_result, embedding_opts, &embedding_service);
         index_result.stats.embedded_chunks = embedded;
         index_result.stats.embedding_errors = emb_errors;
         index_result.stats.embedding_dimension = dimension;
@@ -215,18 +227,14 @@ pub fn index_path_with_options(
     Ok(index_result)
 }
 
-fn run_embedding(index_result: &IndexResult, opts: &EmbeddingOptions) -> (usize, usize, usize) {
-    use atlas_vdb::{EmbeddingService, EmbeddingVector, InMemoryVectorStore, VectorStore};
+fn run_embedding_with_service(
+    index_result: &IndexResult,
+    opts: &EmbeddingOptions,
+    embedding_service: &dyn atlas_vdb::EmbeddingService,
+) -> (usize, usize, usize) {
+    use atlas_vdb::{EmbeddingVector, InMemoryVectorStore, VectorStore};
 
     log::info!("Starting embedding generation for {} chunks", index_result.stats.total_chunks);
-
-    let embedding_service = match atlas_vdb::OnnxEmbeddingService::new(opts.config.clone()) {
-        Ok(svc) => svc,
-        Err(e) => {
-            log::error!("Failed to initialize embedding service: {}", e);
-            return (0, index_result.stats.total_chunks, 0);
-        }
-    };
 
     let all_chunks: Vec<&CodeChunk> = index_result
         .files
@@ -317,9 +325,30 @@ pub fn search(
     parser: &dyn ParseSource,
     options: &SearchOptions,
 ) -> AtlasResult<Vec<SearchResult>> {
-    use atlas_vdb::{EmbeddingService, VectorStore};
-
     let path = path.into();
+
+    let embedding_service = atlas_vdb::OnnxEmbeddingService::new(options.embedding_config.clone())
+        .map_err(|e: atlas_vdb::VdbError| {
+            AtlasError::internal(format!("Failed to initialize embedding service: {}", e))
+                .with_context(
+                    ErrorContext::default()
+                        .with_operation("search")
+                        .with_path(&options.embedding_config.model_path),
+                )
+                .with_source(e.to_string())
+        })?;
+
+    search_with_service(query, &path, parser, options, &embedding_service)
+}
+
+pub fn search_with_service(
+    query: &str,
+    path: &std::path::Path,
+    parser: &dyn ParseSource,
+    options: &SearchOptions,
+    embedding_service: &dyn atlas_vdb::EmbeddingService,
+) -> AtlasResult<Vec<SearchResult>> {
+    use atlas_vdb::VectorStore;
 
     if !path.exists() {
         return Err(AtlasError::invalid_input(format!("Path does not exist: {}", path.display())));
@@ -345,22 +374,6 @@ pub fn search(
     }
 
     log::info!("Loaded vector store with {} vectors", store.len());
-
-    log::info!(
-        "Initializing embedding model from {}",
-        options.embedding_config.model_path.display()
-    );
-
-    let embedding_service = atlas_vdb::OnnxEmbeddingService::new(options.embedding_config.clone())
-        .map_err(|e: atlas_vdb::VdbError| {
-            AtlasError::internal(format!("Failed to initialize embedding service: {}", e))
-                .with_context(
-                    ErrorContext::default()
-                        .with_operation("search")
-                        .with_path(&options.embedding_config.model_path),
-                )
-                .with_source(e.to_string())
-        })?;
 
     log::info!("Embedding query: {:?}", query);
 
@@ -394,7 +407,7 @@ pub fn search(
 
     log::info!("Found {} candidate results, re-indexing to resolve chunk info", raw_results.len());
 
-    let index_result = index_path(&path, parser)?;
+    let index_result = index_path(path, parser)?;
     let chunk_map: std::collections::HashMap<String, CodeChunk> = index_result
         .files
         .iter()

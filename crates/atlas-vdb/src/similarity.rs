@@ -130,4 +130,75 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_cosine_similarity_symmetry() {
+        let pairs = vec![
+            (vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            (vec![1.0, 0.0], vec![0.0, 1.0]),
+            (vec![3.0, 4.0], vec![1.0, 0.0]),
+            (vec![1.0, -1.0, 0.0], vec![1.0, 1.0, 0.0]),
+        ];
+        for (a, b) in pairs {
+            let ab = cosine_similarity(&a, &b);
+            let ba = cosine_similarity(&b, &a);
+            assert!((ab - ba).abs() < 1e-6, "Not symmetric: cos(a,b)={ab}, cos(b,a)={ba}");
+        }
+    }
+
+    #[test]
+    fn test_cosine_similarity_commutative_with_scaling() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        let b_scaled: Vec<f32> = b.iter().map(|x| x * 10.0).collect();
+        let s1 = cosine_similarity(&a, &b);
+        let s2 = cosine_similarity(&a, &b_scaled);
+        assert!((s1 - s2).abs() < 1e-6, "Scaling should not affect cosine similarity");
+    }
+
+    #[test]
+    fn test_cosine_similarity_value_range_exhaustive() {
+        let test_cases = vec![
+            (vec![1.0, 0.0, 0.0], vec![1.0, 0.0, 0.0], 1.0),
+            (vec![1.0, 0.0, 0.0], vec![-1.0, 0.0, 0.0], -1.0),
+            (vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], 0.0),
+        ];
+        for (a, b, expected) in test_cases {
+            let score = cosine_similarity(&a, &b);
+            assert!(
+                (score - expected).abs() < 1e-6,
+                "Expected {expected}, got {score} for {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dot_product_commutative() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        let ab = dot_product(&a, &b);
+        let ba = dot_product(&b, &a);
+        assert!((ab - ba).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dot_product_distributive() {
+        let a = vec![1.0, 2.0];
+        let b = vec![3.0, 4.0];
+        let c = vec![5.0, 6.0];
+        let ab = dot_product(&a, &b);
+        let ac = dot_product(&a, &c);
+        let bc_sum: Vec<f32> = b.iter().zip(c.iter()).map(|(x, y)| x + y).collect();
+        let a_bc = dot_product(&a, &bc_sum);
+        assert!((ab + ac - a_bc).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_high_dimensional() {
+        let dim = 256;
+        let a: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i as f32).cos()).collect();
+        let score = cosine_similarity(&a, &b);
+        assert!((-1.0..=1.0).contains(&score));
+    }
 }
