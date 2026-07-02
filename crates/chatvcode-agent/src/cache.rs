@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 use chatvcode_llm::ToolResult;
 use lru::LruCache;
 
+#[derive(Debug)]
 struct CacheEntry {
     result: ToolResult,
     inserted_at: Instant,
 }
 
+#[derive(Debug)]
 pub struct ToolResultCache {
     cache: Mutex<LruCache<String, CacheEntry>>,
     ttl: Duration,

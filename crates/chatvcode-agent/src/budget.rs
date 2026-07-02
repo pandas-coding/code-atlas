@@ -49,6 +49,14 @@ pub struct TokenBudgetManager {
     estimator: Box<dyn TokenEstimator>,
 }
 
+impl std::fmt::Debug for TokenBudgetManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenBudgetManager")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TokenBudgetManager {
     pub fn new(config: TokenBudgetConfig) -> Self {
         Self { config, estimator: Box::new(SimpleTokenEstimator::new()) }
