@@ -25,7 +25,7 @@ pub use error::{AgentError, AgentResult};
 pub use executor::{BuiltinToolRegistry, ToolExecutor};
 pub use loop_detector::{LoopDetectionResult, LoopDetector};
 pub use prompt::AgentPromptBuilder;
-pub use service::AgentService;
+pub use service::{AgentBuilder, AgentService, agent_query, agent_query_stream};
 pub use session::AgentSession;
 pub use state::{AgentStateMachine, TransitionEvent};
 pub use tools::{
