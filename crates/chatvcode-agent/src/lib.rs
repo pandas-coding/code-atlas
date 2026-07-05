@@ -16,6 +16,7 @@ pub mod types;
 pub use budget::{
     BudgetReport, SessionContext, SimpleTokenEstimator, TokenBudgetManager, TokenEstimator,
 };
+pub use agent_loop::AgentLoop;
 pub use context::{
     AgentServices, ChunkMetadataStoreAdapter, ChunkMetadataStoreTrait, CodeSearchService,
     CoreSearchService, ToolContext,

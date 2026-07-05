@@ -218,6 +218,11 @@ impl AgentSession {
         &self.config
     }
 
+    /// Agent 配置可变引用（用于 `continue_execution` 放宽步数限制等场景）。
+    pub fn config_mut(&mut self) -> &mut AgentConfig {
+        &mut self.config
+    }
+
     /// 当前 Agent 状态。
     #[must_use]
     pub fn state(&self) -> AgentState {
