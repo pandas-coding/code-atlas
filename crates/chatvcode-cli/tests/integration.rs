@@ -13,6 +13,7 @@ use chatvcode_cli::chatvcode_llm::{
 use chatvcode_cli::chatvcode_parser::parse_source;
 use chatvcode_cli::chatvcode_vdb::EmbeddingConfig;
 use chatvcode_cli::{Cli, Commands, format_index_result, format_search_results};
+use chatvcode_cli::agent::AgentCommand;
 use clap::Parser;
 
 fn create_rust_project() -> TempDir {
@@ -280,7 +281,8 @@ fn cli_commands_index_parses_path() {
         Commands::Index { path, .. } => assert_eq!(path, "/some/path"),
         Commands::Search { .. } => {}
         Commands::Chat { .. } => {}
-        Commands::Model { .. } => {}
+        Commands::Model { .. } => {},
+        Commands::Agent(_) => {},
     }
 }
 
@@ -346,6 +348,7 @@ fn cli_commands_search_parses_query() {
         Commands::Index { .. } => panic!("expected Search command"),
         Commands::Chat { .. } => panic!("expected Search command"),
         Commands::Model { .. } => panic!("expected Search command"),
+        Commands::Agent(_) => panic!("expected Search command"),
     }
 }
 
@@ -360,6 +363,7 @@ fn cli_commands_search_default_top_k() {
         Commands::Index { .. } => panic!("expected Search command"),
         Commands::Chat { .. } => panic!("expected Search command"),
         Commands::Model { .. } => panic!("expected Search command"),
+        Commands::Agent(_) => panic!("expected Search command"),
     }
 }
 
@@ -381,6 +385,7 @@ fn cli_commands_search_custom_top_k() {
         Commands::Index { .. } => panic!("expected Search command"),
         Commands::Chat { .. } => panic!("expected Search command"),
         Commands::Model { .. } => panic!("expected Search command"),
+        Commands::Agent(_) => panic!("expected Search command"),
     }
 }
 
@@ -402,6 +407,7 @@ fn cli_commands_search_with_min_score() {
         Commands::Index { .. } => panic!("expected Search command"),
         Commands::Chat { .. } => panic!("expected Search command"),
         Commands::Model { .. } => panic!("expected Search command"),
+        Commands::Agent(_) => panic!("expected Search command"),
     }
 }
 
@@ -1075,4 +1081,130 @@ fn cli_chat_rag_prompt_format_snippets() {
     assert!(snippets[0].contains("src/parser.rs:42-58"));
     assert!(snippets[0].contains("function: parse"));
     assert!(snippets[0].contains("0.890"));
+}
+
+// ===========================================================================
+// Agent command integration tests
+// ===========================================================================
+
+#[test]
+fn cli_agent_command_parses_question_and_path() {
+    let cli = Cli::try_parse_from([
+        "chatvcode", "agent", "How does error handling work?", "--path", "/my/project",
+    ]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { question, path, .. }) = parsed.command {
+            assert_eq!(question.as_deref(), Some("How does error handling work?"));
+            assert_eq!(path, "/my/project");
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_default_path_is_dot() {
+    let cli = Cli::try_parse_from(["chatvcode", "agent", "test"]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { path, .. }) = parsed.command {
+            assert_eq!(path, ".");
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_interactive_short_flag() {
+    let cli = Cli::try_parse_from(["chatvcode", "agent", "-i", "--path", "/tmp/p"]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { interactive, path, question, .. }) = parsed.command {
+            assert!(interactive);
+            assert_eq!(path, "/tmp/p");
+            assert!(question.is_none());
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_verbose_short_flag() {
+    let cli = Cli::try_parse_from(["chatvcode", "agent", "hi", "-v"]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { verbose, .. }) = parsed.command {
+            assert!(verbose);
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_json_and_no_stream() {
+    let cli = Cli::try_parse_from([
+        "chatvcode", "agent", "hi", "--json", "--no-stream", "--max-steps", "8", "--timeout", "60",
+    ]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { json, no_stream, max_steps, timeout, .. }) = parsed.command {
+            assert!(json);
+            assert!(no_stream);
+            assert_eq!(max_steps, Some(8));
+            assert_eq!(timeout, Some(60));
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_tools_csv() {
+    let cli = Cli::try_parse_from([
+        "chatvcode", "agent", "hi", "--tools", "read_file,grep_code",
+    ]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { tools, .. }) = parsed.command {
+            assert_eq!(tools.as_deref(), Some("read_file,grep_code"));
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_confirm_plan_and_model() {
+    let cli = Cli::try_parse_from([
+        "chatvcode", "agent", "hi", "--confirm-plan", "--model", "/m/qwen.gguf",
+    ]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { confirm_plan, model, .. }) = parsed.command {
+            assert!(confirm_plan);
+            assert_eq!(model.as_deref(), Some("/m/qwen.gguf"));
+        } else {
+            panic!("expected Agent command");
+        }
+    }
+}
+
+#[test]
+fn cli_agent_command_mock_llm() {
+    let cli = Cli::try_parse_from([
+        "chatvcode", "agent", "hi", "--mock-llm", "--mock-llm-response", "fake answer",
+    ]);
+    assert!(cli.is_ok());
+    if let Ok(parsed) = cli {
+        if let Commands::Agent(AgentCommand { mock_llm, mock_llm_response, .. }) = parsed.command {
+            assert!(mock_llm);
+            assert_eq!(mock_llm_response.as_deref(), Some("fake answer"));
+        } else {
+            panic!("expected Agent command");
+        }
+    }
 }

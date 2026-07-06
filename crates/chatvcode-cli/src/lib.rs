@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub mod agent;
+
 use chatvcode_core::{
     ChatOptions, ChatResponse, ChatVCodeError, EmbeddingOptions, ErrorSeverity, IndexOptions,
     IndexResult, SearchOptions, SourceReference, chat_with_context, chat_with_context_stream,
@@ -31,7 +33,7 @@ pub use chatvcode_vdb;
 ///
 /// This allows the same GGUF model used for LLM inference to also generate
 /// embeddings for RAG retrieval, eliminating the need for a separate ONNX model.
-struct LlamaEmbeddingAdapter {
+pub(crate) struct LlamaEmbeddingAdapter {
     inner: LlamaEmbeddingService,
 }
 
@@ -273,6 +275,16 @@ pub enum Commands {
         #[arg(long, help = "Path to configuration file (~/.chatvcode/config.json)")]
         config: Option<String>,
     },
+    /// Run an autonomous agent that explores the codebase using built-in tools.
+    ///
+    /// The agent uses a Thinking ↔ Acting state machine to perform multi-step
+    /// reasoning, invokes tools (read_file, list_files, grep_code, etc.), and
+    /// produces a final answer backed by an execution trace.
+    ///
+    /// Examples:
+    ///   chatvcode agent "How is error handling structured?" --path ./my-project
+    ///   chatvcode agent "Where is the entry point?" -i --mock-llm
+    Agent(agent::AgentCommand),
     /// Manage models: list, inspect, estimate memory, and configure GPU offloading.
     ///
     /// Examples:
@@ -557,6 +569,9 @@ pub fn execute(cli: Cli) -> Result<(), ChatVCodeError> {
         }
         Commands::Model { action } => {
             handle_model_command(action)?;
+        }
+        Commands::Agent(cmd) => {
+            agent::run_agent(cmd)?;
         }
     }
     Ok(())

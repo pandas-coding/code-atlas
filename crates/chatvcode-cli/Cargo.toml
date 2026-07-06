@@ -8,6 +8,7 @@ name = "chatvcode"
 path = "src/main.rs"
 
 [dependencies]
+chatvcode-agent = { path = "../chatvcode-agent" }
 chatvcode-core = { path = "../chatvcode-core" }
 chatvcode-llm = { path = "../chatvcode-llm" }
 chatvcode-parser = { path = "../chatvcode-parser" }

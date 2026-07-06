@@ -240,6 +240,7 @@ name = "chatvcode-cli"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "chatvcode-agent",
  "chatvcode-core",
  "chatvcode-llm",
  "chatvcode-parser",
