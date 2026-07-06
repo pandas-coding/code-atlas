@@ -13,6 +13,9 @@ pub mod state;
 pub mod tools;
 pub mod types;
 
+#[cfg(test)]
+pub mod mock_llm;
+
 pub use budget::{
     BudgetReport, SessionContext, SimpleTokenEstimator, TokenBudgetManager, TokenEstimator,
 };

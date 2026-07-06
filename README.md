@@ -24,7 +24,7 @@ ChatVCode is designed as a modular system to ensure high maintainability and per
 - [x] **M1: Core Engine** - Multi-threaded file system traverse and `tree-sitter` AST chunking integration.
 - [x] **M2: Semantic Search** - Local ONNX embedding integration and embedded Vector DB implementation.
 - [x] **M3: Inference** - `llama.cpp` FFI implementation and streaming generation.
-- [ ] **M4: Agentic Brain** - Prompt-state machine for multi-step codebase reasoning.
+- [x] **M4: Agentic Brain** - Prompt-state machine for multi-step codebase reasoning.
 - [ ] **M5: LSP Server** - `tower-lsp` implementation to serve directly into VS Code.
 
 ## 🛠️ Prerequisites
@@ -137,6 +137,86 @@ chatvcode chat "List all API endpoints" --json
 chatvcode chat "Review this code" --system-prompt "You are a senior Rust developer."
 ```
 
+## 🤖 Agent Command Usage
+
+`chatvcode agent` runs an **agentic loop** that autonomously explores your codebase through multi-step reasoning. Unlike `chat` (single-shot RAG), the agent decides which tools to call (search, read, list, grep), observes results, and iterates until it can answer.
+
+### Prerequisites
+
+The agent works best after indexing (so `search_code` / `search_symbol` are available). File-level tools (`list_files`, `read_file`, `grep_code`, `get_file_structure`) work without an index.
+
+```bash
+chatvcode index ./ --embedding-model <path/to/embedding.gguf>
+```
+
+### Basic Usage
+
+```bash
+# Ask an autonomous question about the project (defaults to current directory)
+chatvcode agent "How is authentication implemented?" --path .
+
+# Use a specific model and limit the number of steps
+chatvcode agent "Find all API endpoints" --model /path/to/model.gguf --max-steps 15
+
+# Print every step (thinking, tool calls, results)
+chatvcode agent "Explain the error handling flow" --verbose
+
+# Emit the final response as JSON (for programmatic consumption)
+chatvcode agent "List the public types in src/lib.rs" --json
+```
+
+### Interactive Mode
+
+```bash
+# Multi-turn REPL with control commands
+chatvcode agent -i --path .
+
+# Inside the REPL:
+#   /help     show available commands
+#   /quit     exit
+#   /retry    re-run the last question
+#   /tools    list available tools
+#   /verbose  toggle verbose output
+#   /budget   show token budget usage
+```
+
+### Available Built-in Tools
+
+| Tool | Description | Requires index? |
+|------|-------------|-----------------|
+| `search_code` | Semantic code search via embeddings | Yes |
+| `search_symbol` | Look up symbols (functions/structs/...) in the metadata store | Yes |
+| `read_file` | Read a file (with optional line range) | No |
+| `list_files` | List files recursively (glob + depth filter) | No |
+| `grep_code` | Regex search across files | No |
+| `get_file_structure` | AST-based file structure overview | No |
+
+### Output Modes
+
+- **Default**: streams the final answer; prints tool call summaries and a stats footer.
+- **`--verbose` / `-v`**: prints every thinking step, tool call, and result.
+- **`--json`**: emits the final `AgentResponse` as JSON.
+- **`--no-stream`**: waits for completion before printing.
+
+### Common Options
+
+| Option | Description |
+|--------|-------------|
+| `--path / -p` | Project directory to analyze (default: `.`) |
+| `--model / -m` | GGUF model path (auto-discovered if omitted) |
+| `--max-steps` | Maximum agent steps (default: 10) |
+| `--timeout` | Agent timeout in seconds (default: 120) |
+| `--tools` | Comma-separated allowlist of tool names |
+| `--interactive / -i` | Interactive REPL mode |
+| `--json` | JSON output mode |
+| `--no-stream` | Disable streaming output |
+| `--confirm-plan` | Require plan confirmation before execution |
+| `--temperature` | Generation temperature (default: 0.7) |
+| `--max-tokens` | Maximum generated tokens (default: 2048) |
+| `--n-ctx` | Context window size (default: 8192) |
+| `--n-gpu-layers` | GPU layers to offload (-1 for all) |
+| `--embedding-model` | Embedding model for `search_code` (falls back to file tools if absent) |
+
 ## 🔧 Troubleshooting
 
 ### Build Issues
@@ -162,7 +242,8 @@ chatvcode/
 ├── third_party/          # C/C++ dependencies (llama.cpp, tree-sitter, etc.)
 ├── crates/               # Rust modular workspace
 │   ├── chatvcode-cli/        # CLI & TUI entry point
-│   ├── chatvcode-core/       # Agent orchestration & RAG pipeline
+│   ├── chatvcode-agent/      # Agentic tool-use loop & state machine
+│   ├── chatvcode-core/       # RAG orchestration & indexing pipeline
 │   ├── chatvcode-parser/     # AST Code chunking engine
 │   ├── chatvcode-vdb/        # Local Vector DB & ONNX Embeddings
 │   └── chatvcode-llm/        # FFI LLM Inference wrapper
