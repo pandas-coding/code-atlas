@@ -1,6 +1,6 @@
 ---
 source: crates/chatvcode-agent/src/prompt.rs
-assertion_line: 363
+assertion_line: 357
 expression: prompt
 ---
 You are ChatVCode Agent, an AI assistant specialized in understanding and reasoning about codebases.
@@ -59,6 +59,36 @@ Semantic code search using embeddings. Finds relevant code chunks by natural lan
 Parameters:
 - query: Natural language query describing the code you're looking for (required)
 - top_k: Maximum number of results to return (default: 10)
+
+## find_references
+Find references to a symbol (function, variable, type, etc.) across the codebase using word-boundary matching. Returns file paths, line numbers, and the matching line content. Useful for locating usages and call sites.
+
+Parameters:
+- symbol: Symbol name to find references for (exact word match) (required)
+- path: Directory or file to search in (relative to project root, default: ".")
+- file_pattern: Glob pattern to filter files (e.g., "*.rs", "*.ts")
+- max_results: Maximum number of references to return (default: 100)
+
+## get_dependencies
+Analyze a source file and extract its dependencies (imports, requires, use statements). Supports Rust, TypeScript/JavaScript, Python, Go, and Java. Returns a list of dependency modules/packages with their import lines.
+
+Parameters:
+- path: Path to the source file to analyze (relative to project root) (required)
+
+## compare_files
+Compare two text files line by line and return the differences. Useful for understanding changes between file versions or comparing similar files. Returns added, removed, and unchanged line blocks.
+
+Parameters:
+- path_a: Path to the first file (relative to project root) (required)
+- path_b: Path to the second file (relative to project root) (required)
+- context_lines: Number of unchanged context lines to show around each diff block (default: 3)
+
+## get_project_overview
+Generate an overview of the project structure: file counts by language, top-level directories, and key manifest files (Cargo.toml, package.json, go.mod, etc.). Useful for quickly understanding a project's layout and tech stack.
+
+Parameters:
+- path: Directory to overview (relative to project root, default: ".")
+- max_depth: Maximum directory depth to traverse (default: 3)
 
 
 

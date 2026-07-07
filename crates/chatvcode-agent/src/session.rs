@@ -13,13 +13,16 @@
 //! - 终态（`Done`/`Failed`）通过 [`AgentSession::set_stop_reason`] 记录停止
 //!   原因，供 `to_response()` 输出。
 
+use std::path::Path;
 use std::time::Instant;
 
 use chatvcode_llm::ChatSession;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::budget::{SessionContext, TokenBudgetManager};
 use crate::cache::ToolResultCache;
+use crate::error::{AgentError, AgentResult};
 use crate::types::{
     AgentConfig, AgentMetrics, AgentResponse, AgentState, AgentStep, AgentStopReason,
     SourceReference, ThinkingPhase, TokenUsage,
@@ -88,6 +91,129 @@ impl AgentSession {
             stop_reason: None,
             final_answer: None,
         }
+    }
+
+    /// 将会话状态序列化为 JSON 字符串，用于持久化与跨进程恢复。
+    ///
+    /// 序列化内容包括：会话 ID、状态机状态、思考阶段、步骤历史、
+    /// 底层对话（通过 [`ChatSession::to_json`]）、累计 token/耗时、
+    /// 指标、停止原因与最终回答。
+    ///
+    /// **不**序列化的内容：
+    /// - `config`：包含 [`std::path::PathBuf`] 等运行时相关字段，应由
+    ///   调用方在恢复时另行提供（见 [`AgentSession::from_json`]）。
+    /// - `tool_cache`：工具结果缓存为临时态，恢复后重建。
+    /// - `started_at`：会话开始时间为运行时态，恢复后重置。
+    ///
+    /// # 错误
+    ///
+    /// 底层序列化失败时返回 [`AgentError::Internal`]。
+    pub fn to_json(&self) -> AgentResult<String> {
+        let chat_session_json = self
+            .chat_session
+            .to_json()
+            .map_err(|e| AgentError::Internal(format!("Failed to serialize chat session: {e}")))?;
+
+        let state = SerializableAgentSession {
+            id: self.id.clone(),
+            state: self.state,
+            thinking_phase: self.thinking_phase,
+            steps: self.steps.clone(),
+            chat_session_json,
+            total_token_usage: self.total_token_usage.clone(),
+            total_duration_ms: self.total_duration_ms,
+            metrics: self.metrics.clone(),
+            stop_reason: self.stop_reason.clone(),
+            final_answer: self.final_answer.clone(),
+        };
+
+        serde_json::to_string_pretty(&state).map_err(|e| {
+            AgentError::Internal(format!("Failed to serialize agent session: {e}"))
+        })
+    }
+
+    /// 从 JSON 字符串恢复会话状态。
+    ///
+    /// `config` 必须由调用方提供（通常与原始会话使用相同的配置），
+    /// 其中的 `chat_template` 用于反序列化底层 [`ChatSession`]，
+    /// `token_budget` 用于重建 [`TokenBudgetManager`]。
+    ///
+    /// 恢复后的会话：
+    /// - 保留原有的步骤历史、对话内容、累计指标与停止原因。
+    /// - `started_at` 重置为当前时刻（影响 `elapsed_ms`）。
+    /// - `tool_cache` 为空。
+    ///
+    /// # 错误
+    ///
+    /// 反序列化失败时返回 [`AgentError::Internal`]。
+    pub fn from_json(json: &str, config: AgentConfig) -> AgentResult<Self> {
+        let state: SerializableAgentSession = serde_json::from_str(json).map_err(|e| {
+            AgentError::Internal(format!("Failed to deserialize agent session: {e}"))
+        })?;
+
+        let chat_template = config.chat_template.clone();
+        let token_budget = config.token_budget.clone();
+        let chat_session = ChatSession::from_json(&state.chat_session_json, chat_template)
+            .map_err(|e| {
+                AgentError::Internal(format!("Failed to restore chat session: {e}"))
+            })?;
+
+        let budget_manager = TokenBudgetManager::new(token_budget);
+
+        Ok(Self {
+            id: state.id,
+            config,
+            state: state.state,
+            thinking_phase: state.thinking_phase,
+            steps: state.steps,
+            chat_session,
+            total_token_usage: state.total_token_usage,
+            total_duration_ms: state.total_duration_ms,
+            started_at: Instant::now(),
+            tool_cache: ToolResultCache::default(),
+            budget_manager,
+            metrics: state.metrics,
+            stop_reason: state.stop_reason,
+            final_answer: state.final_answer,
+        })
+    }
+
+    /// 将会话状态写入文件（JSON 格式）。
+    ///
+    /// 父目录不存在时会自动创建。等价于 `to_json()` 后写入文件。
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> AgentResult<()> {
+        let json = self.to_json()?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AgentError::Internal(format!(
+                        "Failed to create session directory '{}': {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
+        std::fs::write(path, json).map_err(|e| {
+            AgentError::Internal(format!(
+                "Failed to write session file '{}': {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// 从文件恢复会话状态。
+    ///
+    /// 读取文件内容后调用 [`AgentSession::from_json`]。
+    pub fn load_from_file(path: impl AsRef<Path>, config: AgentConfig) -> AgentResult<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            AgentError::Internal(format!(
+                "Failed to read session file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        Self::from_json(&content, config)
     }
 
     /// 当前步骤序号（即已记录的步骤数量）。
@@ -192,7 +318,7 @@ impl AgentSession {
             }
         });
 
-        AgentResponse {
+        let response = AgentResponse {
             answer,
             sources,
             steps: self.steps.clone(),
@@ -201,6 +327,14 @@ impl AgentSession {
             total_tool_calls,
             stop_reason,
             metrics: self.metrics.clone(),
+            self_evaluation: None,
+        };
+
+        // 若配置启用自我评估，则计算并附加评估结果
+        if self.config.enable_self_evaluation {
+            response.with_self_evaluation()
+        } else {
+            response
         }
     }
 
@@ -341,6 +475,34 @@ impl AgentSession {
     pub fn record_loop_detection(&mut self) {
         self.metrics.record_loop_detection();
     }
+}
+
+/// 可序列化的 Agent 会话快照，用于持久化与跨进程恢复。
+///
+/// 不包含 `config` 与运行时态（`started_at`、`tool_cache`），恢复时
+/// 由调用方提供配置，运行时态由 [`AgentSession::from_json`] 重建。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableAgentSession {
+    /// 会话唯一标识。
+    id: String,
+    /// 当前 Agent 状态。
+    state: AgentState,
+    /// 当前思考阶段。
+    thinking_phase: ThinkingPhase,
+    /// 步骤历史。
+    steps: Vec<AgentStep>,
+    /// 底层对话会话的 JSON 序列化（由 `ChatSession::to_json` 产出）。
+    chat_session_json: String,
+    /// 累计 token 使用。
+    total_token_usage: TokenUsage,
+    /// 累计耗时（毫秒）。
+    total_duration_ms: u64,
+    /// 可观测性指标。
+    metrics: AgentMetrics,
+    /// 终态停止原因。
+    stop_reason: Option<AgentStopReason>,
+    /// 最终回答文本。
+    final_answer: Option<String>,
 }
 
 /// 从步骤的工具结果中尽力提取代码来源引用。
@@ -735,5 +897,72 @@ mod tests {
         cfg.chat_template = ChatTemplate::Llama3;
         let s = AgentSession::new(cfg);
         assert_eq!(s.chat_session().template(), &ChatTemplate::Llama3);
+    }
+
+    #[test]
+    fn to_json_from_json_roundtrip_preserves_state() {
+        let mut s = AgentSession::new(minimal_config());
+        s.set_state(AgentState::Acting);
+        s.set_thinking_phase(ThinkingPhase::Observing);
+        s.set_final_answer("the answer");
+        s.set_stop_reason(AgentStopReason::Completed);
+        s.add_step(step(AgentState::Thinking, 50, TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        }));
+        s.chat_session_mut().set_system_prompt(Some("system prompt".into()));
+        s.chat_session_mut().add_user_message("hello".to_string());
+        s.chat_session_mut().add_assistant_message("hi".to_string());
+
+        let json = s.to_json().unwrap();
+        let restored = AgentSession::from_json(&json, minimal_config()).unwrap();
+
+        assert_eq!(restored.id(), s.id());
+        assert_eq!(restored.state(), AgentState::Acting);
+        assert_eq!(restored.thinking_phase(), ThinkingPhase::Observing);
+        assert_eq!(restored.final_answer(), Some("the answer"));
+        assert!(matches!(
+            restored.stop_reason(),
+            Some(AgentStopReason::Completed)
+        ));
+        assert_eq!(restored.current_step(), 1);
+        assert_eq!(restored.total_duration_ms(), 50);
+        assert_eq!(restored.total_token_usage().total_tokens, 15);
+        assert_eq!(
+            restored.chat_session().get_system_prompt(),
+            Some("system prompt")
+        );
+        assert_eq!(restored.chat_session().messages().len(), 2);
+    }
+
+    #[test]
+    fn from_json_invalid_returns_error() {
+        let result = AgentSession::from_json("not valid json", minimal_config());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_and_load_file_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sub").join("session.json");
+
+        let mut s = AgentSession::new(minimal_config());
+        s.set_final_answer("persisted answer");
+        s.add_step(step(AgentState::Thinking, 30, TokenUsage::default()));
+
+        s.save_to_file(&path).unwrap();
+        assert!(path.exists());
+
+        let restored = AgentSession::load_from_file(&path, minimal_config()).unwrap();
+        assert_eq!(restored.final_answer(), Some("persisted answer"));
+        assert_eq!(restored.current_step(), 1);
+    }
+
+    #[test]
+    fn load_from_nonexistent_file_returns_error() {
+        let result =
+            AgentSession::load_from_file("/nonexistent/path/session.json", minimal_config());
+        assert!(result.is_err());
     }
 }

@@ -1,11 +1,19 @@
+mod compare_files;
 mod file_structure;
+mod find_references;
+mod get_dependencies;
+mod get_project_overview;
 mod grep_code;
 mod list_files;
 mod read_file;
 mod search_code;
 mod search_symbol;
 
+pub use compare_files::CompareFilesTool;
 pub use file_structure::GetFileStructureTool;
+pub use find_references::FindReferencesTool;
+pub use get_dependencies::GetDependenciesTool;
+pub use get_project_overview::GetProjectOverviewTool;
 pub use grep_code::GrepCodeTool;
 pub use list_files::ListFilesTool;
 pub use read_file::ReadFileTool;
@@ -74,6 +82,10 @@ pub fn register_all_tools() -> Vec<Box<dyn BuiltinTool>> {
         Box::new(GetFileStructureTool),
         Box::new(SearchSymbolTool),
         Box::new(SearchCodeTool),
+        Box::new(FindReferencesTool),
+        Box::new(GetDependenciesTool),
+        Box::new(CompareFilesTool),
+        Box::new(GetProjectOverviewTool),
     ]
 }
 
@@ -128,7 +140,7 @@ mod tests {
     #[test]
     fn test_register_all_tools() {
         let tools = register_all_tools();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 10);
         let names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"list_files".to_string()));
@@ -136,13 +148,17 @@ mod tests {
         assert!(names.contains(&"get_file_structure".to_string()));
         assert!(names.contains(&"search_symbol".to_string()));
         assert!(names.contains(&"search_code".to_string()));
+        assert!(names.contains(&"find_references".to_string()));
+        assert!(names.contains(&"get_dependencies".to_string()));
+        assert!(names.contains(&"compare_files".to_string()));
+        assert!(names.contains(&"get_project_overview".to_string()));
     }
 
     #[test]
     fn test_build_tool_definitions() {
         let tools = register_all_tools();
         let defs = build_tool_definitions(&tools);
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 10);
         for def in &defs {
             assert!(!def.name.is_empty());
             assert!(!def.description.is_empty());

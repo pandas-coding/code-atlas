@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chatvcode_agent::{
     AgentBuilder, AgentConfig, AgentEvent, AgentResponse, AgentServices, AgentStopReason,
-    ChunkMetadataStoreAdapter, CodeSearchService, CoreSearchService, TokenBudgetConfig,
-    ToolRetryConfig,
+    ChunkMetadataStoreAdapter, CodeSearchService, CoreSearchService, PerformanceBenchmark,
+    TokenBudgetConfig, ToolRetryConfig, TraceRenderer,
 };
 use chatvcode_core::{ChatVCodeError, ChatOptions, ErrorSeverity, ParseSource};
 use chatvcode_llm::{
@@ -105,6 +105,18 @@ pub struct AgentCommand {
     /// Mock LLM 回复内容。
     #[arg(long, hide = true, help = "Response text for mock LLM")]
     pub mock_llm_response: Option<String>,
+
+    /// 在同一步骤中并行执行多个工具调用。
+    #[arg(long, default_value_t = false, num_args = 0..=1, help = "Enable parallel tool execution")]
+    pub parallel_tools: bool,
+
+    /// 在最终回答后执行自我评估。
+    #[arg(long, default_value_t = false, num_args = 0..=1, help = "Enable self-evaluation after answering")]
+    pub self_eval: bool,
+
+    /// 将执行轨迹导出为 HTML（.html）或 Markdown（.md）文件。
+    #[arg(long, help = "Export execution trace to file (format by extension: .html or .md)")]
+    pub trace: Option<String>,
 }
 
 /// 运行 `chatvcode agent` 命令。
@@ -129,7 +141,7 @@ pub fn run_agent(cmd: AgentCommand) -> Result<(), ChatVCodeError> {
         )
     })?;
 
-    run_agent_single(&cmd, question, Arc::from(llm))
+    run_agent_single(&cmd, question, Arc::from(llm)).map(|_| ())
 }
 
 /// 运行一次 Agent 查询（单次模式）。
@@ -137,7 +149,7 @@ fn run_agent_single(
     cmd: &AgentCommand,
     question: String,
     llm: Arc<dyn LlmService>,
-) -> Result<(), ChatVCodeError> {
+) -> Result<AgentResponse, ChatVCodeError> {
     let config = build_agent_config(cmd);
     let services = build_agent_services(cmd)?;
 
@@ -164,7 +176,26 @@ fn run_agent_single(
         print_response(cmd, &response, answer_printed);
     }
 
-    Ok(())
+    // 若指定了 --trace，导出执行轨迹到文件
+    if let Some(trace_path) = &cmd.trace {
+        let path = PathBuf::from(trace_path);
+        let content = if path.extension().and_then(|e| e.to_str()) == Some("html") {
+            TraceRenderer::render_html(&response)
+        } else {
+            TraceRenderer::render_markdown(&response)
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        match std::fs::write(&path, content) {
+            Ok(()) => eprintln!("✓ Trace exported to {}", path.display()),
+            Err(e) => eprintln!("✗ Failed to write trace '{}': {e}", path.display()),
+        }
+    }
+
+    Ok(response)
 }
 
 /// 消费事件流，并在 verbose 模式下实时展示执行轨迹。
@@ -289,6 +320,8 @@ fn run_agent_interactive(
 
     let mut verbose = cmd.verbose;
     let mut last_question: Option<String> = None;
+    let mut last_response: Option<AgentResponse> = None;
+    let mut benchmark = PerformanceBenchmark::new();
 
     loop {
         let readline = rl.readline("🤖 > ");
@@ -301,15 +334,26 @@ fn run_agent_interactive(
                 let _ = rl.add_history_entry(&input);
 
                 if input.starts_with('/') {
-                    match handle_agent_command(&input, &cmd, &mut verbose, &last_question) {
+                    match handle_agent_command(
+                        &input,
+                        &cmd,
+                        &mut verbose,
+                        &last_question,
+                        &mut last_response,
+                        &mut benchmark,
+                    ) {
                         AgentReplAction::Continue => continue,
                         AgentReplAction::Quit => break,
                         AgentReplAction::Run(q) => {
                             last_question = Some(q.clone());
                             let mut single_cmd = cmd.clone();
                             single_cmd.verbose = verbose;
-                            if let Err(e) = run_agent_single(&single_cmd, q, Arc::clone(&llm)) {
-                                eprintln!("✗ {e}");
+                            match run_agent_single(&single_cmd, q, Arc::clone(&llm)) {
+                                Ok(resp) => {
+                                    benchmark.add(&resp);
+                                    last_response = Some(resp);
+                                }
+                                Err(e) => eprintln!("✗ {e}"),
                             }
                         }
                     }
@@ -317,8 +361,12 @@ fn run_agent_interactive(
                     last_question = Some(input.clone());
                     let mut single_cmd = cmd.clone();
                     single_cmd.verbose = verbose;
-                    if let Err(e) = run_agent_single(&single_cmd, input, Arc::clone(&llm)) {
-                        eprintln!("✗ {e}");
+                    match run_agent_single(&single_cmd, input, Arc::clone(&llm)) {
+                        Ok(resp) => {
+                            benchmark.add(&resp);
+                            last_response = Some(resp);
+                        }
+                        Err(e) => eprintln!("✗ {e}"),
                     }
                 }
             }
@@ -350,12 +398,19 @@ enum AgentReplAction {
     Run(String),
 }
 
+/// 默认的 Agent 会话保存路径（`~/.chatvcode/agent_session.json`）。
+fn agent_default_session_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".chatvcode").join("agent_session.json"))
+}
+
 /// 处理 REPL 控制命令。
 fn handle_agent_command(
     input: &str,
     cmd: &AgentCommand,
     verbose: &mut bool,
     last_question: &Option<String>,
+    last_response: &mut Option<AgentResponse>,
+    benchmark: &mut PerformanceBenchmark,
 ) -> AgentReplAction {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let name = parts[0];
@@ -371,6 +426,7 @@ fn handle_agent_command(
             AgentReplAction::Quit
         }
         "/clear" => {
+            *last_response = None;
             eprintln!("✓ Agent history cleared (each turn is independent).");
             AgentReplAction::Continue
         }
@@ -388,7 +444,11 @@ fn handle_agent_command(
             AgentReplAction::Continue
         }
         "/steps" => {
-            eprintln!("ℹ Step history inspection in REPL mode is not yet supported.");
+            if let Some(resp) = last_response.as_ref() {
+                print_session_steps(resp);
+            } else {
+                eprintln!("(No previous session. Run a query first.)");
+            }
             AgentReplAction::Continue
         }
         "/tools" => {
@@ -404,9 +464,20 @@ fn handle_agent_command(
             eprintln!("Token budget (configured): {:?}", build_agent_config(cmd).token_budget);
             AgentReplAction::Continue
         }
-        "/export" => {
-            let _ = arg;
-            eprintln!("ℹ /export is not yet supported in agent REPL mode.");
+        "/export" | "/save" => {
+            handle_save_command(arg, last_response);
+            AgentReplAction::Continue
+        }
+        "/load" => {
+            handle_load_command(arg, last_response);
+            AgentReplAction::Continue
+        }
+        "/trace" => {
+            handle_trace_command(arg, last_response);
+            AgentReplAction::Continue
+        }
+        "/benchmark" | "/bench" => {
+            handle_benchmark_command(benchmark);
             AgentReplAction::Continue
         }
         "/model" => {
@@ -420,25 +491,212 @@ fn handle_agent_command(
     }
 }
 
+/// 处理 `/save [path]` 命令：将最近一次 Agent 响应序列化为 JSON 并写入文件。
+fn handle_save_command(arg: Option<&str>, last_response: &Option<AgentResponse>) {
+    let Some(resp) = last_response.as_ref() else {
+        eprintln!("(No session to save. Run a query first.)");
+        return;
+    };
+
+    let path = match arg.map(PathBuf::from) {
+        Some(p) => p,
+        None => match agent_default_session_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("✗ Could not determine default save path. Specify a path: /save <path>");
+                return;
+            }
+        },
+    };
+
+    match serde_json::to_string_pretty(resp) {
+        Ok(json) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("✗ Failed to create directory '{}': {e}", parent.display());
+                        return;
+                    }
+                }
+            }
+            match std::fs::write(&path, json) {
+                Ok(()) => eprintln!("✓ Session saved to {}", path.display()),
+                Err(e) => eprintln!("✗ Failed to write '{}': {e}", path.display()),
+            }
+        }
+        Err(e) => eprintln!("✗ Failed to serialize session: {e}"),
+    }
+}
+
+/// 处理 `/load [path]` 命令：从 JSON 文件恢复 Agent 响应并展示摘要。
+fn handle_load_command(arg: Option<&str>, last_response: &mut Option<AgentResponse>) {
+    let path = match arg.map(PathBuf::from) {
+        Some(p) => p,
+        None => match agent_default_session_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("✗ Could not determine default load path. Specify a path: /load <path>");
+                return;
+            }
+        },
+    };
+
+    if !path.exists() {
+        eprintln!("✗ File not found: {}", path.display());
+        return;
+    }
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ Failed to read '{}': {e}", path.display());
+            return;
+        }
+    };
+
+    match serde_json::from_str::<AgentResponse>(&content) {
+        Ok(resp) => {
+            eprintln!("✓ Session loaded from {}", path.display());
+            print_session_summary(&resp);
+            *last_response = Some(resp);
+        }
+        Err(e) => {
+            eprintln!("✗ Failed to parse session JSON: {e}");
+        }
+    }
+}
+
+/// 打印会话步骤摘要（用于 `/steps` 命令）。
+fn print_session_steps(resp: &AgentResponse) {
+    if resp.steps.is_empty() {
+        eprintln!("(No steps recorded.)");
+        return;
+    }
+    eprintln!("📋 Session steps ({} total):", resp.steps.len());
+    for step in &resp.steps {
+        let tool_count = step.tool_calls.len();
+        eprintln!(
+            "  Step {}: {:?} ({} tool call{}, {}ms, {} tokens)",
+            step.step_number,
+            step.state,
+            tool_count,
+            if tool_count == 1 { "" } else { "s" },
+            step.duration_ms,
+            step.token_usage.total_tokens,
+        );
+        for call in &step.tool_calls {
+            eprintln!("    → {}({})", call.name, call.arguments.len());
+        }
+    }
+}
+
+/// 打印已加载会话的摘要（用于 `/load` 命令）。
+fn print_session_summary(resp: &AgentResponse) {
+    eprintln!("📊 Session summary:");
+    eprintln!("  Steps:         {}", resp.metrics.total_steps);
+    eprintln!("  Tool calls:    {}", resp.total_tool_calls);
+    eprintln!(
+        "  Tokens:        {} prompt + {} completion = {} total",
+        resp.total_token_usage.prompt_tokens,
+        resp.total_token_usage.completion_tokens,
+        resp.total_token_usage.total_tokens,
+    );
+    eprintln!("  Duration:      {:.2}s", resp.total_duration_ms as f64 / 1000.0);
+    eprintln!("  Stop reason:   {:?}", resp.stop_reason);
+    if !resp.answer.is_empty() {
+        eprintln!("  Answer:        {}", truncate_str(&resp.answer, 200));
+    }
+}
+
+/// 处理 `/trace [path]` 命令：将最近一次执行的轨迹导出为 HTML 或 Markdown。
+///
+/// 文件扩展名决定格式：`.html` -> HTML，`.md` -> Markdown。
+/// 不指定路径时输出 Markdown 到 stderr。
+fn handle_trace_command(arg: Option<&str>, last_response: &Option<AgentResponse>) {
+    let Some(resp) = last_response.as_ref() else {
+        eprintln!("(No session to trace. Run a query first.)");
+        return;
+    };
+
+    match arg {
+        Some(path_str) => {
+            let path = PathBuf::from(path_str);
+            let content = if path.extension().and_then(|e| e.to_str()) == Some("html") {
+                TraceRenderer::render_html(resp)
+            } else {
+                TraceRenderer::render_markdown(resp)
+            };
+
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("✗ Failed to create directory '{}': {e}", parent.display());
+                        return;
+                    }
+                }
+            }
+            match std::fs::write(&path, content) {
+                Ok(()) => eprintln!("✓ Trace exported to {}", path.display()),
+                Err(e) => eprintln!("✗ Failed to write '{}': {e}", path.display()),
+            }
+        }
+        None => {
+            let md = TraceRenderer::render_markdown(resp);
+            eprintln!("{md}");
+        }
+    }
+}
+
+/// 处理 `/benchmark` 命令：输出聚合的性能基准报告。
+fn handle_benchmark_command(benchmark: &PerformanceBenchmark) {
+    if benchmark.run_count == 0 {
+        eprintln!("(No runs recorded. Run queries first.)");
+        return;
+    }
+    let md = benchmark.render_markdown();
+    eprintln!("{md}");
+}
+
+/// 将字符串截断到指定字符数并附加省略号。
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let prefix: String = s.chars().take(max).collect();
+    format!("{prefix}...")
+}
+
 fn print_agent_help() {
     eprintln!("Agent REPL commands:");
-    eprintln!("  /help, /h        Show this help");
-    eprintln!("  /quit, /q        Exit");
-    eprintln!("  /clear           Clear conversation state");
+    eprintln!("  /help, /h         Show this help");
+    eprintln!("  /quit, /q         Exit");
+    eprintln!("  /clear            Clear conversation state");
     eprintln!("  /retry, /r        Retry the last question");
-    eprintln!("  /continue        Continue execution (not yet supported)");
-    eprintln!("  /steps            Show step history (not yet supported)");
-    eprintln!("  /tools           List available tools");
-    eprintln!("  /verbose         Toggle verbose mode");
-    eprintln!("  /budget          Show token budget");
-    eprintln!("  /export <file>  Export session (not yet supported)");
-    eprintln!("  /model           Show model info");
+    eprintln!("  /continue         Continue execution (not yet supported)");
+    eprintln!("  /steps            Show step history of the last session");
+    eprintln!("  /tools            List available tools");
+    eprintln!("  /verbose          Toggle verbose mode");
+    eprintln!("  /budget           Show token budget");
+    eprintln!("  /save [path]      Save last session to JSON (default: ~/.chatvcode/agent_session.json)");
+    eprintln!("  /load [path]      Load session from JSON (default: ~/.chatvcode/agent_session.json)");
+    eprintln!("  /trace [path]     Export execution trace as HTML (.html) or Markdown (.md)");
+    eprintln!("  /benchmark        Show aggregated performance benchmark");
+    eprintln!("  /export [path]    Alias of /save");
+    eprintln!("  /model            Show model info");
 }
 
 fn print_available_tools() {
     let tools = [
-        "read_file", "list_files", "grep_code", "get_file_structure", "search_symbol",
+        "read_file",
+        "list_files",
+        "grep_code",
+        "get_file_structure",
+        "search_symbol",
         "search_code",
+        "find_references",
+        "get_dependencies",
+        "compare_files",
+        "get_project_overview",
     ];
     eprintln!("Built-in tools:");
     for t in tools {
@@ -518,6 +776,8 @@ fn build_agent_config(cmd: &AgentCommand) -> AgentConfig {
     config.project_path = PathBuf::from(&cmd.path);
     config.verbose = cmd.verbose;
     config.require_plan_confirmation = cmd.confirm_plan;
+    config.enable_parallel_tool_calls = cmd.parallel_tools;
+    config.enable_self_evaluation = cmd.self_eval;
     config.generation_params = GenerationParams::default()
         .with_temperature(cmd.temperature)
         .with_max_tokens(cmd.max_tokens);
@@ -845,12 +1105,17 @@ mod tests {
             embedding_model: None,
             mock_llm: true,
             mock_llm_response: None,
+            parallel_tools: true,
+            self_eval: true,
+            trace: None,
         };
         let cfg = build_agent_config(&cmd);
         assert_eq!(cfg.max_steps, 7);
         assert_eq!(cfg.timeout_secs, 30);
         assert!(cfg.verbose);
         assert!(cfg.require_plan_confirmation);
+        assert!(cfg.enable_parallel_tool_calls);
+        assert!(cfg.enable_self_evaluation);
         assert_eq!(cfg.allowed_tools, vec!["read_file"]);
         assert_eq!(cfg.token_budget.total_budget, 4096);
     }
@@ -860,5 +1125,95 @@ mod tests {
         let svc = NoSearchService;
         let result = svc.search("anything", 5);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_command_writes_json_file() {
+        use chatvcode_agent::{AgentMetrics, AgentResponse, AgentStopReason, SourceReference,
+            TokenUsage};
+        
+        
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.json");
+
+        let resp = AgentResponse {
+            answer: "test answer".into(),
+            sources: vec![SourceReference {
+                file_path: "src/main.rs".into(),
+                line_start: 1,
+                line_end: 5,
+                symbol_name: Some("main".into()),
+                relevance: 1.0,
+            }],
+            steps: vec![],
+            total_token_usage: TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            total_duration_ms: 100,
+            total_tool_calls: 0,
+            stop_reason: AgentStopReason::Completed,
+            metrics: AgentMetrics::default(),
+            self_evaluation: None,
+        };
+
+        handle_save_command(Some(path.to_str().unwrap()), &Some(resp));
+
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("test answer"));
+        assert!(content.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn save_command_without_session_prints_message() {
+        handle_save_command(Some("/nonexistent/save.json"), &None);
+    }
+
+    #[test]
+    fn load_command_reads_json_file() {
+        use chatvcode_agent::{AgentMetrics, AgentResponse};
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("loaded.json");
+
+        let json = serde_json::json!({
+            "answer": "loaded answer",
+            "sources": [],
+            "steps": [],
+            "total_token_usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            "total_duration_ms": 50,
+            "total_tool_calls": 1,
+            "stop_reason": "Completed",
+            "metrics": AgentMetrics::default(),
+        });
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(serde_json::to_string(&json).unwrap().as_bytes())
+            .unwrap();
+
+        let mut last: Option<AgentResponse> = None;
+        handle_load_command(Some(path.to_str().unwrap()), &mut last);
+
+        assert!(last.is_some());
+        assert_eq!(last.unwrap().answer, "loaded answer");
+    }
+
+    #[test]
+    fn load_command_missing_file_prints_error() {
+        let mut last: Option<AgentResponse> = None;
+        handle_load_command(Some("/nonexistent/load.json"), &mut last);
+        assert!(last.is_none());
+    }
+
+    #[test]
+    fn truncate_str_short_and_long() {
+        assert_eq!(truncate_str("hi", 10), "hi");
+        let long = "x".repeat(50);
+        let t = truncate_str(&long, 10);
+        assert!(t.ends_with("..."));
+        assert_eq!(t.chars().count(), 13);
     }
 }

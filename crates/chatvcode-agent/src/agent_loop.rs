@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use chatvcode_llm::{LlmService, ToolCall, ToolResult, parse_tool_calls};
 
 use crate::budget::SessionContext;
+use crate::confirmation::ConfirmationHandler;
 use crate::context::{AgentServices, ToolContext};
 use crate::error::{AgentError, AgentResult};
 use crate::executor::ToolExecutor;
@@ -65,6 +66,8 @@ pub struct AgentLoop {
     /// 最近一次执行的查询（供 [`continue_execution`](Self::continue_execution)
     /// 与 [`retry`](Self::retry) 使用）。
     last_query: Option<String>,
+    /// 可选的用户确认处理器（仅在 `require_plan_confirmation = true` 时生效）。
+    confirmation_handler: Option<Arc<dyn ConfirmationHandler>>,
 }
 
 impl AgentLoop {
@@ -91,6 +94,7 @@ impl AgentLoop {
             event_sender: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             last_query: None,
+            confirmation_handler: None,
         }
     }
 
@@ -100,6 +104,15 @@ impl AgentLoop {
     #[must_use]
     pub fn with_event_sender(mut self, sender: mpsc::Sender<AgentEvent>) -> Self {
         self.event_sender = Some(sender);
+        self
+    }
+
+    /// 附带一个用户确认处理器，在关键操作前请求用户确认。
+    ///
+    /// 仅当 [`AgentConfig::require_plan_confirmation`] 为 `true` 时生效。
+    #[must_use]
+    pub fn with_confirmation_handler(mut self, handler: Arc<dyn ConfirmationHandler>) -> Self {
+        self.confirmation_handler = Some(handler);
         self
     }
 
@@ -361,73 +374,72 @@ impl AgentLoop {
 
     // ---- Acting 阶段 -----------------------------------------------------
 
-    /// 执行 Acting 阶段：从状态机取出待执行工具调用，依次执行，
+    /// 执行 Acting 阶段：从状态机取出待执行工具调用，依次或并行执行，
     /// 截断结果，注入观察提示词，记录步骤。
     ///
     /// 返回 [`TransitionEvent::ToolsExecuted`]。
+    ///
+    /// 当 [`AgentConfig::enable_parallel_tool_calls`] 为 `true` 且本步骤有
+    /// 多个工具调用时，使用 `std::thread::scope` 并行执行；否则顺序执行。
     fn do_acting(&mut self) -> AgentResult<TransitionEvent> {
         let start = Instant::now();
         let pending = self.state_machine.take_pending_tool_calls();
         let max_calls = self.session.config().max_tool_calls_per_step;
         let calls_to_execute: Vec<ToolCall> = pending.into_iter().take(max_calls).collect();
 
+        // 用户确认机制：若启用且配置了确认处理器，在执行前请求确认
+        if self.session.config().require_plan_confirmation
+            && let Some(handler) = &self.confirmation_handler
+        {
+            let completed_steps = self.session.current_step();
+            let total_tokens = self.session.total_token_usage().total_tokens;
+            let dummy_step = AgentStep {
+                step_number: completed_steps + 1,
+                state: AgentState::Acting,
+                thinking_phase: None,
+                thought: None,
+                tool_calls: calls_to_execute.clone(),
+                tool_results: vec![],
+                duration_ms: 0,
+                token_usage: TokenUsage::default(),
+            };
+            if let Some(req) = crate::confirmation::build_confirmation_request(
+                &dummy_step,
+                completed_steps,
+                total_tokens,
+            ) {
+                match handler.confirm(&req) {
+                    crate::confirmation::ConfirmationResponse::Approve => {}
+                    crate::confirmation::ConfirmationResponse::ApproveAll => {
+                        // 关闭后续确认
+                        let config = self.session.config_mut();
+                        config.require_plan_confirmation = false;
+                    }
+                    crate::confirmation::ConfirmationResponse::Deny => {
+                        self.session.set_state(AgentState::Failed);
+                        self.session
+                            .set_stop_reason(AgentStopReason::UserCancel);
+                        self.send_event(AgentEvent::Error {
+                            message: "Execution denied by user".into(),
+                        });
+                        return Ok(TransitionEvent::UnrecoverableError(
+                            "User denied execution".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
         let project_path = self.session.config().project_path.clone();
         let token_budget = self.session.config().token_budget.tool_result_max;
         let timeout = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
+        let enable_parallel = self.session.config().enable_parallel_tool_calls;
 
-        let mut results: Vec<ToolResult> = Vec::with_capacity(calls_to_execute.len());
-        for call in &calls_to_execute {
-            self.send_event(AgentEvent::ToolCallStarted {
-                name: call.name.clone(),
-                arguments: serde_json::Value::Object(
-                    call.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                ),
-            });
-
-            let ctx = ToolContext {
-                project_path: project_path.clone(),
-                timeout,
-                token_budget,
-                services: Arc::clone(&self.services),
-            };
-
-            let result = match self.tool_executor.execute(call, &ctx) {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
-                    self.send_event(AgentEvent::ToolCallFailed {
-                        name: call.name.clone(),
-                        error: msg.clone(),
-                        will_retry: false,
-                    });
-                    let mut err = ToolResult::error(msg);
-                    if let Some(ref id) = call.id {
-                        err = err.with_call_id(id.clone());
-                    }
-                    err
-                }
-            };
-
-            if result.success {
-                self.send_event(AgentEvent::ToolCallCompleted {
-                    name: call.name.clone(),
-                    result: result.clone(),
-                    cached: false,
-                });
-            } else {
-                let error_msg = match &result.value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.send_event(AgentEvent::ToolCallFailed {
-                    name: call.name.clone(),
-                    error: error_msg,
-                    will_retry: false,
-                });
-            }
-
-            results.push(result);
-        }
+        let results = if enable_parallel && calls_to_execute.len() > 1 {
+            self.execute_tools_parallel(&calls_to_execute, project_path, timeout, token_budget)
+        } else {
+            self.execute_tools_sequential(&calls_to_execute, project_path, timeout, token_budget)
+        };
 
         let truncated_results = self.truncate_results(&results);
 
@@ -459,6 +471,164 @@ impl AgentLoop {
 
         self.session.set_thinking_phase(ThinkingPhase::Observing);
         Ok(TransitionEvent::ToolsExecuted(truncated_results))
+    }
+
+    /// 顺序执行工具调用（原有行为）。
+    fn execute_tools_sequential(
+        &self,
+        calls: &[ToolCall],
+        project_path: std::path::PathBuf,
+        timeout: Duration,
+        token_budget: usize,
+    ) -> Vec<ToolResult> {
+        let mut results: Vec<ToolResult> = Vec::with_capacity(calls.len());
+        for call in calls {
+            self.send_event(AgentEvent::ToolCallStarted {
+                name: call.name.clone(),
+                arguments: serde_json::Value::Object(
+                    call.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                ),
+            });
+
+            let ctx = ToolContext {
+                project_path: project_path.clone(),
+                timeout,
+                token_budget,
+                services: Arc::clone(&self.services),
+            };
+
+            let result = match self.tool_executor.execute(call, &ctx) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.send_event(AgentEvent::ToolCallFailed {
+                        name: call.name.clone(),
+                        error: msg.clone(),
+                        will_retry: false,
+                    });
+                    let mut err = ToolResult::error(msg);
+                    if let Some(ref id) = call.id {
+                        err = err.with_call_id(id.clone());
+                    }
+                    err
+                }
+            };
+
+            self.emit_tool_completion(call, &result);
+            results.push(result);
+        }
+        results
+    }
+
+    /// 并行执行工具调用（使用 `std::thread::scope`）。
+    ///
+    /// 各工具调用在独立线程中执行，结果按原始顺序返回。事件发送在
+    /// 线程内进行（`mpsc::Sender` 是 `Sync` 的）。若任一线程 panic，
+    /// 该调用的结果会被记录为错误。
+    fn execute_tools_parallel(
+        &self,
+        calls: &[ToolCall],
+        project_path: std::path::PathBuf,
+        timeout: Duration,
+        token_budget: usize,
+    ) -> Vec<ToolResult> {
+        use std::thread;
+
+        // 先发送所有 ToolCallStarted 事件
+        for call in calls {
+            self.send_event(AgentEvent::ToolCallStarted {
+                name: call.name.clone(),
+                arguments: serde_json::Value::Object(
+                    call.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                ),
+            });
+        }
+
+        let tool_executor = Arc::clone(&self.tool_executor);
+        let services = Arc::clone(&self.services);
+        let event_sender = self.event_sender.clone();
+
+        let results: Vec<ToolResult> = thread::scope(|s| {
+            let handles: Vec<_> = calls
+                .iter()
+                .map(|call| {
+                    let project_path = project_path.clone();
+                    let tool_executor = Arc::clone(&tool_executor);
+                    let services = Arc::clone(&services);
+                    let event_sender = event_sender.clone();
+                    let call = call.clone();
+                    s.spawn(move || {
+                        let ctx = ToolContext {
+                            project_path,
+                            timeout,
+                            token_budget,
+                            services,
+                        };
+                        let result = match tool_executor.execute(&call, &ctx) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if let Some(sender) = &event_sender {
+                                    let _ = sender.send(AgentEvent::ToolCallFailed {
+                                        name: call.name.clone(),
+                                        error: msg.clone(),
+                                        will_retry: false,
+                                    });
+                                }
+                                let mut err = ToolResult::error(msg);
+                                if let Some(ref id) = call.id {
+                                    err = err.with_call_id(id.clone());
+                                }
+                                err
+                            }
+                        };
+                        (call.name, result)
+                    })
+                })
+                .collect();
+
+            let mut results: Vec<ToolResult> = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok((name, result)) => {
+                        self.emit_tool_completion_by_name(&name, &result);
+                        results.push(result);
+                    }
+                    Err(_) => {
+                        results.push(ToolResult::error("Tool thread panicked"));
+                    }
+                }
+            }
+            results
+        });
+
+        results
+    }
+
+    /// 发送工具完成/失败事件（按 call 名称）。
+    fn emit_tool_completion_by_name(&self, name: &str, result: &ToolResult) {
+        if result.success {
+            self.send_event(AgentEvent::ToolCallCompleted {
+                name: name.to_string(),
+                result: result.clone(),
+                cached: false,
+            });
+        } else {
+            let error_msg = match &result.value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            self.send_event(AgentEvent::ToolCallFailed {
+                name: name.to_string(),
+                error: error_msg,
+                will_retry: false,
+            });
+        }
+    }
+
+    /// 发送工具完成/失败事件（按 call 引用）。
+    fn emit_tool_completion(&self, call: &ToolCall, result: &ToolResult) {
+        self.emit_tool_completion_by_name(&call.name, result);
     }
 
     /// 截断过大的工具结果以适配 token 预算。
@@ -1084,5 +1254,112 @@ mod tests {
         let mut agent = make_agent(vec!["answer".into()], make_config(3));
         let response = agent.run("").unwrap();
         assert_eq!(response.answer, "answer");
+    }
+
+    #[test]
+    fn parallel_tool_calls_executes_all_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "world").unwrap();
+
+        let mut config = make_config(10);
+        config.project_path = tmp.path().to_path_buf();
+        config.enable_parallel_tool_calls = true;
+
+        // 两个并行工具调用 + 最终回答
+        let call = r#"[{"name":"read_file","arguments":{"path":"a.txt"}},{"name":"read_file","arguments":{"path":"b.txt"}}]"#;
+        let final_answer = "Read both files.";
+        let mut agent = make_agent(vec![call.into(), final_answer.into()], config);
+        let response = agent.run("Read both").unwrap();
+        assert_eq!(response.answer, "Read both files.");
+        // Acting 步骤应携带 2 个工具调用
+        let acting: Vec<_> = response
+            .steps
+            .iter()
+            .filter(|s| s.state == AgentState::Acting)
+            .collect();
+        assert_eq!(acting.len(), 1);
+        assert_eq!(acting[0].tool_calls.len(), 2);
+        assert_eq!(acting[0].tool_results.len(), 2);
+        // 两个结果都应成功
+        assert!(acting[0].tool_results.iter().all(|r| r.success));
+    }
+
+    #[test]
+    fn self_evaluation_included_when_enabled() {
+        let mut config = make_config(5);
+        config.enable_self_evaluation = true;
+
+        let mut agent = make_agent(vec!["short".into()], config);
+        let response = agent.run("q").unwrap();
+        let eval = response.self_evaluation.expect("self_evaluation should be set");
+        assert!(eval.confidence_score >= 0.0 && eval.confidence_score <= 1.0);
+        assert!(!eval.notes.is_empty());
+        // 短回答 + 无来源引用 -> 置信度不应为满分
+        assert!(eval.confidence_score < 1.0);
+    }
+
+    #[test]
+    fn self_evaluation_absent_when_disabled() {
+        let mut agent = make_agent(vec!["answer".into()], make_config(5));
+        let response = agent.run("q").unwrap();
+        assert!(response.self_evaluation.is_none());
+    }
+
+    #[test]
+    fn confirmation_handler_can_deny_execution() {
+        use crate::confirmation::{ConfirmationRequest, ConfirmationResponse};
+
+        struct DenyHandler;
+        impl crate::confirmation::ConfirmationHandler for DenyHandler {
+            fn confirm(&self, _request: &ConfirmationRequest) -> ConfirmationResponse {
+                ConfirmationResponse::Deny
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_config(10);
+        config.project_path = tmp.path().to_path_buf();
+        config.require_plan_confirmation = true;
+
+        let tool_call = r#"{"name":"list_files","arguments":{"path":"."}}"#;
+        let final_answer = "Done.";
+        let llm: Arc<dyn LlmService> = Arc::new(ScriptedLlm::new(vec![
+            tool_call.into(),
+            final_answer.into(),
+        ]));
+        let mut agent = AgentLoop::new(config, llm, make_registry(), make_services())
+            .with_confirmation_handler(Arc::new(DenyHandler));
+
+        let response = agent.run("q").unwrap();
+        // 用户拒绝 -> Failed
+        assert!(matches!(response.stop_reason, AgentStopReason::UserCancel));
+    }
+
+    #[test]
+    fn confirmation_handler_approve_all_skips_future_confirmations() {
+        use crate::confirmation::{ConfirmationRequest, ConfirmationResponse};
+
+        struct ApproveAllHandler;
+        impl crate::confirmation::ConfirmationHandler for ApproveAllHandler {
+            fn confirm(&self, _request: &ConfirmationRequest) -> ConfirmationResponse {
+                ConfirmationResponse::ApproveAll
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_config(10);
+        config.project_path = tmp.path().to_path_buf();
+        config.require_plan_confirmation = true;
+
+        let tool_call = r#"{"name":"list_files","arguments":{"path":"."}}"#;
+        let final_answer = "Done.";
+        let mut agent = make_agent(vec![tool_call.into(), final_answer.into()], config)
+            .with_confirmation_handler(Arc::new(ApproveAllHandler));
+
+        let response = agent.run("q").unwrap();
+        // ApproveAll -> 执行继续 -> 完成
+        assert_eq!(response.answer, "Done.");
+        assert!(matches!(response.stop_reason, AgentStopReason::Completed));
     }
 }
