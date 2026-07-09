@@ -6,6 +6,7 @@ members = [
     "crates/chatvcode-vdb",
     "crates/chatvcode-llm",
     "crates/chatvcode-agent",
+    "crates/chatvcode-server",
 ]
 resolver = "3"
 

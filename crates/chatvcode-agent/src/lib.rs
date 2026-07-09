@@ -5,9 +5,13 @@ pub mod confirmation;
 pub mod context;
 pub mod error;
 pub mod executor;
+pub mod hot_reload;
 pub mod loop_detector;
 pub mod metrics;
+pub mod orchestrator;
 pub mod prompt;
+pub mod prompt_optimizer;
+pub mod scenario;
 pub mod service;
 pub mod session;
 pub mod state;
@@ -32,15 +36,27 @@ pub use context::{
 };
 pub use error::{AgentError, AgentResult};
 pub use executor::{BuiltinToolRegistry, ToolExecutor};
+pub use hot_reload::RuntimeToolRegistry;
 pub use loop_detector::{LoopDetectionResult, LoopDetector};
+pub use orchestrator::{
+    AgentMessage, AgentOrchestrator, AgentTask, DefaultAgentRunner, OrchestrationResult,
+    SubAgentRunner,
+};
 pub use prompt::AgentPromptBuilder;
+pub use prompt_optimizer::{
+    OptimizationResult, PromptMetric, PromptOptimizer, PromptRunRunner, PromptVariant, VariantScore,
+};
+pub use scenario::{
+    DocumentScenario, GenericTextScenario, Scenario, ScenarioRegistry, ListDocsTool,
+    ReadTextFileTool, SearchTextTool,
+};
 pub use service::{AgentBuilder, AgentService, agent_query, agent_query_stream};
 pub use session::AgentSession;
 pub use state::{AgentStateMachine, TransitionEvent};
 pub use trace::{PerformanceBenchmark, TraceRenderer};
 pub use tools::{
-    BuiltinTool, CompareFilesTool, FindReferencesTool, GetDependenciesTool,
+    BuiltinTool, CompareFilesTool, EditFileTool, FindReferencesTool, GetDependenciesTool,
     GetFileStructureTool, GetProjectOverviewTool, GrepCodeTool, ListFilesTool, ReadFileTool,
-    SearchCodeTool, SearchSymbolTool,
+    RunCommandTool, SearchCodeTool, SearchSymbolTool, WriteFileTool,
 };
 pub use types::*;

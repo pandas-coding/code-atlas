@@ -309,6 +309,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chatvcode-server"
+version = "0.1.0"
+dependencies = [
+ "chatvcode-agent",
+ "chatvcode-core",
+ "chatvcode-llm",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "chatvcode-vdb"
 version = "0.1.0"
 dependencies = [

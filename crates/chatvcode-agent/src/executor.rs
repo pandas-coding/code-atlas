@@ -11,9 +11,10 @@ use crate::cache::ToolResultCache;
 use crate::context::ToolContext;
 use crate::error::AgentError;
 use crate::tools::{
-    self, BuiltinTool, CompareFilesTool, FindReferencesTool, GetDependenciesTool,
-    GetFileStructureTool, GetProjectOverviewTool, GrepCodeTool, ListFilesTool, ReadFileTool,
-    SearchCodeTool, SearchSymbolTool,
+    self, BuiltinTool, CompareFilesTool, EditFileTool, FindReferencesTool,
+    GetDependenciesTool, GetFileStructureTool, GetProjectOverviewTool, GrepCodeTool,
+    ListFilesTool, ReadFileTool, RunCommandTool, SearchCodeTool, SearchSymbolTool,
+    WriteFileTool,
 };
 use crate::types::ToolRetryConfig;
 
@@ -51,6 +52,9 @@ impl BuiltinToolRegistry {
         self.tools.push(Arc::new(GetDependenciesTool));
         self.tools.push(Arc::new(CompareFilesTool));
         self.tools.push(Arc::new(GetProjectOverviewTool));
+        self.tools.push(Arc::new(WriteFileTool));
+        self.tools.push(Arc::new(EditFileTool));
+        self.tools.push(Arc::new(RunCommandTool::new()));
     }
 
     fn find_tool(&self, name: &str) -> Option<Arc<dyn BuiltinTool>> {
@@ -663,7 +667,7 @@ mod tests {
     fn test_register_defaults() {
         let mut reg = BuiltinToolRegistry::new(ToolRetryConfig::default());
         reg.register_defaults();
-        assert_eq!(reg.list_tools().len(), 10);
+        assert_eq!(reg.list_tools().len(), 13);
         assert!(reg.has_tool("read_file"));
         assert!(reg.has_tool("list_files"));
         assert!(reg.has_tool("grep_code"));
@@ -674,6 +678,9 @@ mod tests {
         assert!(reg.has_tool("get_dependencies"));
         assert!(reg.has_tool("compare_files"));
         assert!(reg.has_tool("get_project_overview"));
+        assert!(reg.has_tool("write_file"));
+        assert!(reg.has_tool("edit_file"));
+        assert!(reg.has_tool("run_command"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod compare_files;
+mod edit_file;
 mod file_structure;
 mod find_references;
 mod get_dependencies;
@@ -6,10 +7,13 @@ mod get_project_overview;
 mod grep_code;
 mod list_files;
 mod read_file;
+mod run_command;
 mod search_code;
 mod search_symbol;
+mod write_file;
 
 pub use compare_files::CompareFilesTool;
+pub use edit_file::EditFileTool;
 pub use file_structure::GetFileStructureTool;
 pub use find_references::FindReferencesTool;
 pub use get_dependencies::GetDependenciesTool;
@@ -17,8 +21,10 @@ pub use get_project_overview::GetProjectOverviewTool;
 pub use grep_code::GrepCodeTool;
 pub use list_files::ListFilesTool;
 pub use read_file::ReadFileTool;
+pub use run_command::RunCommandTool;
 pub use search_code::SearchCodeTool;
 pub use search_symbol::SearchSymbolTool;
+pub use write_file::WriteFileTool;
 
 use chatvcode_llm::{ToolCall, ToolDefinition, ToolResult};
 use serde_json::Value;
@@ -86,6 +92,9 @@ pub fn register_all_tools() -> Vec<Box<dyn BuiltinTool>> {
         Box::new(GetDependenciesTool),
         Box::new(CompareFilesTool),
         Box::new(GetProjectOverviewTool),
+        Box::new(WriteFileTool),
+        Box::new(EditFileTool),
+        Box::new(RunCommandTool::new()),
     ]
 }
 
@@ -132,6 +141,59 @@ pub(crate) fn resolve_safe_path(
     Ok(canonical_target)
 }
 
+/// 写安全路径解析：在父目录尚未存在时也能正确解析路径（用于写入类工具）。
+///
+/// 与 [`resolve_safe_path`] 不同，本函数不依赖目标已存在：它规范化项目
+/// 目录后，把相对 `file_path` 拼接到规范化项目下，再用纯词汇方式消除
+/// `..`/`.`，最后做边界检查。
+pub(crate) fn resolve_safe_path_for_write(
+    project_path: &std::path::Path,
+    file_path: &str,
+) -> Result<std::path::PathBuf, AgentError> {
+    use std::path::{Component, Path, PathBuf};
+
+    let canonical_project = project_path
+        .canonicalize()
+        .map_err(|e| AgentError::ToolError {
+            tool_name: "path_check".into(),
+            message: format!("Cannot canonicalize project path '{}': {}", project_path.display(), e),
+        })?;
+
+    let joined: PathBuf = if Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        canonical_project.join(file_path)
+    };
+
+    // 词汇规范化：消除 ``.`` 与 ``..``，保留前缀（如 Windows ``\\?\``）
+    let mut normalized = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 仅在仍有可弹出的非前缀组件时弹出
+                let can_pop = normalized.parent().is_some()
+                    && !matches!(
+                        normalized.components().next_back(),
+                        Some(Component::Prefix(_) | Component::RootDir)
+                    );
+                if can_pop {
+                    normalized.pop();
+                }
+            }
+            c => normalized.push(c.as_os_str()),
+        }
+    }
+
+    if !normalized.starts_with(&canonical_project) {
+        return Err(AgentError::ToolError {
+            tool_name: "path_check".into(),
+            message: format!("Path '{}' is outside the project directory", file_path),
+        });
+    }
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +202,7 @@ mod tests {
     #[test]
     fn test_register_all_tools() {
         let tools = register_all_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 13);
         let names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"list_files".to_string()));
@@ -152,13 +214,16 @@ mod tests {
         assert!(names.contains(&"get_dependencies".to_string()));
         assert!(names.contains(&"compare_files".to_string()));
         assert!(names.contains(&"get_project_overview".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(names.contains(&"run_command".to_string()));
     }
 
     #[test]
     fn test_build_tool_definitions() {
         let tools = register_all_tools();
         let defs = build_tool_definitions(&tools);
-        assert_eq!(defs.len(), 10);
+        assert_eq!(defs.len(), 13);
         for def in &defs {
             assert!(!def.name.is_empty());
             assert!(!def.description.is_empty());
